@@ -26,6 +26,16 @@
 namespace inja {
 
 /*!
+@brief Helper struct for tracking not found variables/functions
+*/
+struct NotFoundInfo {
+  std::string name;
+  const AstNode* node;
+  
+  NotFoundInfo(const std::string& name, const AstNode* node) : name(name), node(node) {}
+};
+
+/*!
 @brief Escapes HTML
 */
 inline std::string htmlescape(const std::string& data) {
@@ -67,9 +77,11 @@ class Renderer : public NodeVisitor {
 
   std::vector<std::shared_ptr<json>> data_tmp_stack;
   std::stack<const json*> data_eval_stack;
-  std::stack<const DataNode*> not_found_stack;
+  std::stack<NotFoundInfo> not_found_stack; // Can hold DataNode or FunctionNode for error reporting
 
   bool break_rendering {false};
+  
+  std::vector<RenderErrorInfo> render_errors; // Track errors in graceful mode
 
   static bool truthy(const json* data) {
     if (data->is_boolean()) {
@@ -101,15 +113,30 @@ class Renderer : public NodeVisitor {
 
   const std::shared_ptr<json> eval_expression_list(const ExpressionListNode& expression_list) {
     if (!expression_list.root) {
-      throw_renderer_error("empty expression", expression_list);
+      std::string original_text;
+      if (config.graceful_errors && expression_list.length > 0) {
+        original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+      }
+      throw_renderer_error("empty expression", expression_list, original_text);
+      return nullptr;
     }
 
     expression_list.root->accept(*this);
 
     if (data_eval_stack.empty()) {
-      throw_renderer_error("empty expression", expression_list);
+      std::string original_text;
+      if (config.graceful_errors && expression_list.length > 0) {
+        original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+      }
+      throw_renderer_error("empty expression", expression_list, original_text);
+      return nullptr;
     } else if (data_eval_stack.size() != 1) {
-      throw_renderer_error("malformed expression", expression_list);
+      std::string original_text;
+      if (config.graceful_errors && expression_list.length > 0) {
+        original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+      }
+      throw_renderer_error("malformed expression", expression_list, original_text);
+      return nullptr;
     }
 
     const auto result = data_eval_stack.top();
@@ -117,20 +144,34 @@ class Renderer : public NodeVisitor {
 
     if (!result) {
       if (not_found_stack.empty()) {
-        throw_renderer_error("expression could not be evaluated", expression_list);
+        std::string original_text;
+        if (config.graceful_errors && expression_list.length > 0) {
+          original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+        }
+        throw_renderer_error("expression could not be evaluated", expression_list, original_text);
+        return nullptr;
       }
 
-      const auto node = not_found_stack.top();
+      const auto not_found = not_found_stack.top();
       not_found_stack.pop();
 
-      throw_renderer_error("variable '" + static_cast<std::string>(node->name) + "' not found", *node);
+      std::string original_text;
+      if (config.graceful_errors && expression_list.length > 0) {
+        original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+      }
+      throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node, original_text);
+      return nullptr;
     }
     return std::make_shared<json>(*result);
   }
 
-  void throw_renderer_error(const std::string& message, const AstNode& node) {
+  void throw_renderer_error(const std::string& message, const AstNode& node, const std::string& original_text = "") {
     const SourceLocation loc = get_source_location(current_template->content, node.pos);
-    INJA_THROW(RenderError(message, loc));
+    if (config.graceful_errors) {
+      render_errors.emplace_back(message, loc, original_text);
+    } else {
+      INJA_THROW(RenderError(message, loc));
+    }
   }
 
   void make_result(const json&& result) {
@@ -158,11 +199,11 @@ class Renderer : public NodeVisitor {
       data_eval_stack.pop();
 
       if (!result[N - i - 1]) {
-        const auto data_node = not_found_stack.top();
+        const auto not_found = not_found_stack.top();
         not_found_stack.pop();
 
         if (throw_not_found) {
-          throw_renderer_error("variable '" + static_cast<std::string>(data_node->name) + "' not found", *data_node);
+          throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node);
         }
       }
     }
@@ -185,11 +226,11 @@ class Renderer : public NodeVisitor {
       data_eval_stack.pop();
 
       if (!result[N - i - 1]) {
-        const auto data_node = not_found_stack.top();
+        const auto not_found = not_found_stack.top();
         not_found_stack.pop();
 
         if (throw_not_found) {
-          throw_renderer_error("variable '" + static_cast<std::string>(data_node->name) + "' not found", *data_node);
+          throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node);
         }
       }
     }
@@ -231,7 +272,7 @@ class Renderer : public NodeVisitor {
         data_eval_stack.push(value.get());
       } else {
         data_eval_stack.push(nullptr);
-        not_found_stack.emplace(&node);
+        not_found_stack.emplace(static_cast<std::string>(node.name), &node);
       }
     }
   }
@@ -329,10 +370,10 @@ class Renderer : public NodeVisitor {
       if (not_found_stack.empty()) {
         throw_renderer_error("could not find element with given name", node);
       }
-      const auto id_node = not_found_stack.top();
+      const auto not_found = not_found_stack.top();
       not_found_stack.pop();
       data_eval_stack.pop();
-      data_eval_stack.push(&container->at(id_node->name));
+      data_eval_stack.push(&container->at(not_found.name));
     } break;
     case Op::At: {
       const auto args = get_arguments<2>(node);
@@ -457,8 +498,14 @@ class Renderer : public NodeVisitor {
       make_result(get_arguments<1>(node)[0]->is_string());
     } break;
     case Op::Callback: {
-      auto args = get_argument_vector(node);
-      make_result(node.callback(args));
+      if (!node.callback && config.graceful_errors) {
+        // Unknown function without callback in graceful mode
+        data_eval_stack.push(nullptr);
+        not_found_stack.emplace(node.name, &node);
+      } else {
+        auto args = get_argument_vector(node);
+        make_result(node.callback(args));
+      }
     } break;
     case Op::Super: {
       const auto args = get_argument_vector(node);
@@ -505,13 +552,25 @@ class Renderer : public NodeVisitor {
       }
       make_result(os.str());
     } break;
-    case Op::None:
-      break;
+    case Op::None: {
+      // Unknown function in graceful error mode
+      if (config.graceful_errors) {
+        // Push nullptr to trigger graceful error handling
+        data_eval_stack.push(nullptr);
+        not_found_stack.emplace(node.name, &node);
+      }
+    } break;
     }
   }
 
   void visit(const ExpressionListNode& node) {
-    print_data(eval_expression_list(node));
+    auto result = eval_expression_list(node);
+    if (result) {
+      print_data(result);
+    } else if (config.graceful_errors && node.length > 0) {
+      // In graceful mode, output the original template text
+      *output_stream << current_template->content.substr(node.pos, node.length);
+    }
   }
 
   void visit(const StatementNode&) {}
@@ -664,6 +723,14 @@ public:
     current_template->root.accept(*this);
 
     data_tmp_stack.clear();
+  }
+  
+  const std::vector<RenderErrorInfo>& get_render_errors() const {
+    return render_errors;
+  }
+  
+  void clear_render_errors() {
+    render_errors.clear();
   }
 };
 

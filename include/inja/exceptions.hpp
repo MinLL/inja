@@ -43,6 +43,18 @@ struct DataError : public InjaError {
   explicit DataError(const std::string& message, SourceLocation location): InjaError("data_error", message, location) {}
 };
 
+/*!
+ * \brief Structure for tracking render errors in graceful mode
+ */
+struct RenderErrorInfo {
+  std::string message;
+  SourceLocation location;
+  std::string original_text;
+  
+  RenderErrorInfo(const std::string& message, SourceLocation location, const std::string& original_text = "")
+      : message(message), location(location), original_text(original_text) {}
+};
+
 } // namespace inja
 
 #endif // INCLUDE_INJA_EXCEPTIONS_HPP_

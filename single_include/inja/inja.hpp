@@ -307,6 +307,18 @@ struct DataError : public InjaError {
   explicit DataError(const std::string& message, SourceLocation location): InjaError("data_error", message, location) {}
 };
 
+/*!
+ * \brief Structure for tracking render errors in graceful mode
+ */
+struct RenderErrorInfo {
+  std::string message;
+  SourceLocation location;
+  std::string original_text;
+  
+  RenderErrorInfo(const std::string& message, SourceLocation location, const std::string& original_text = "")
+      : message(message), location(location), original_text(original_text) {}
+};
+
 } // namespace inja
 
 #endif // INCLUDE_INJA_EXCEPTIONS_HPP_
@@ -618,6 +630,7 @@ public:
 class ExpressionListNode : public AstNode {
 public:
   std::shared_ptr<ExpressionNode> root;
+  size_t length {0}; // Length of the expression in the template (including delimiters)
 
   explicit ExpressionListNode(): AstNode(0) {}
   explicit ExpressionListNode(size_t pos): AstNode(pos) {}
@@ -902,6 +915,7 @@ struct LexerConfig {
  */
 struct ParserConfig {
   bool search_included_templates_in_files {true};
+  bool graceful_errors {false}; // If true, allow unknown functions at parse time
 
   std::function<Template(const std::filesystem::path&, const std::string&)> include_callback;
 };
@@ -912,6 +926,7 @@ struct ParserConfig {
 struct RenderConfig {
   bool throw_at_missing_includes {true};
   bool html_autoescape {false};
+  bool graceful_errors {false}; // If true, missing variables/functions render as original template text
 };
 
 } // namespace inja
@@ -1676,11 +1691,16 @@ class Parser {
 
           auto function_data = function_storage.find_function(func->name, func->number_args);
           if (function_data.operation == FunctionStorage::Operation::None) {
-            throw_parser_error("unknown function " + func->name);
-          }
-          func->operation = function_data.operation;
-          if (function_data.operation == FunctionStorage::Operation::Callback) {
-            func->callback = function_data.callback;
+            if (!config.graceful_errors) {
+              throw_parser_error("unknown function " + func->name);
+            }
+            // In graceful mode, explicitly set operation to None to be handled at render time
+            func->operation = FunctionStorage::Operation::None;
+          } else {
+            func->operation = function_data.operation;
+            if (function_data.operation == FunctionStorage::Operation::Callback) {
+              func->callback = function_data.callback;
+            }
           }
           arguments.emplace_back(func);
 
@@ -2042,15 +2062,20 @@ class Parser {
         }
       } break;
       case Token::Kind::ExpressionOpen: {
+        const size_t expr_start = tok.text.data() - tmpl.content.c_str();
         get_next_token();
 
-        auto expression_list_node = std::make_shared<ExpressionListNode>(tok.text.data() - tmpl.content.c_str());
+        auto expression_list_node = std::make_shared<ExpressionListNode>(expr_start);
         current_block->nodes.emplace_back(expression_list_node);
         current_expression_list = expression_list_node.get();
 
         if (!parse_expression(tmpl, Token::Kind::ExpressionClose)) {
           throw_parser_error("expected expression close, got '" + tok.describe() + "'");
         }
+        
+        // Calculate the length of the expression including delimiters
+        const size_t expr_end = tok.text.data() - tmpl.content.c_str() + tok.text.length();
+        current_expression_list->length = expr_end - expr_start;
       } break;
       case Token::Kind::CommentOpen: {
         get_next_token();
@@ -2133,6 +2158,16 @@ public:
 namespace inja {
 
 /*!
+@brief Helper struct for tracking not found variables/functions
+*/
+struct NotFoundInfo {
+  std::string name;
+  const AstNode* node;
+  
+  NotFoundInfo(const std::string& name, const AstNode* node) : name(name), node(node) {}
+};
+
+/*!
 @brief Escapes HTML
 */
 inline std::string htmlescape(const std::string& data) {
@@ -2174,9 +2209,11 @@ class Renderer : public NodeVisitor {
 
   std::vector<std::shared_ptr<json>> data_tmp_stack;
   std::stack<const json*> data_eval_stack;
-  std::stack<const DataNode*> not_found_stack;
+  std::stack<NotFoundInfo> not_found_stack; // Can hold DataNode or FunctionNode for error reporting
 
   bool break_rendering {false};
+  
+  std::vector<RenderErrorInfo> render_errors; // Track errors in graceful mode
 
   static bool truthy(const json* data) {
     if (data->is_boolean()) {
@@ -2208,15 +2245,30 @@ class Renderer : public NodeVisitor {
 
   const std::shared_ptr<json> eval_expression_list(const ExpressionListNode& expression_list) {
     if (!expression_list.root) {
-      throw_renderer_error("empty expression", expression_list);
+      std::string original_text;
+      if (config.graceful_errors && expression_list.length > 0) {
+        original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+      }
+      throw_renderer_error("empty expression", expression_list, original_text);
+      return nullptr;
     }
 
     expression_list.root->accept(*this);
 
     if (data_eval_stack.empty()) {
-      throw_renderer_error("empty expression", expression_list);
+      std::string original_text;
+      if (config.graceful_errors && expression_list.length > 0) {
+        original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+      }
+      throw_renderer_error("empty expression", expression_list, original_text);
+      return nullptr;
     } else if (data_eval_stack.size() != 1) {
-      throw_renderer_error("malformed expression", expression_list);
+      std::string original_text;
+      if (config.graceful_errors && expression_list.length > 0) {
+        original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+      }
+      throw_renderer_error("malformed expression", expression_list, original_text);
+      return nullptr;
     }
 
     const auto result = data_eval_stack.top();
@@ -2224,20 +2276,34 @@ class Renderer : public NodeVisitor {
 
     if (!result) {
       if (not_found_stack.empty()) {
-        throw_renderer_error("expression could not be evaluated", expression_list);
+        std::string original_text;
+        if (config.graceful_errors && expression_list.length > 0) {
+          original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+        }
+        throw_renderer_error("expression could not be evaluated", expression_list, original_text);
+        return nullptr;
       }
 
-      const auto node = not_found_stack.top();
+      const auto not_found = not_found_stack.top();
       not_found_stack.pop();
 
-      throw_renderer_error("variable '" + static_cast<std::string>(node->name) + "' not found", *node);
+      std::string original_text;
+      if (config.graceful_errors && expression_list.length > 0) {
+        original_text = current_template->content.substr(expression_list.pos, expression_list.length);
+      }
+      throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node, original_text);
+      return nullptr;
     }
     return std::make_shared<json>(*result);
   }
 
-  void throw_renderer_error(const std::string& message, const AstNode& node) {
+  void throw_renderer_error(const std::string& message, const AstNode& node, const std::string& original_text = "") {
     const SourceLocation loc = get_source_location(current_template->content, node.pos);
-    INJA_THROW(RenderError(message, loc));
+    if (config.graceful_errors) {
+      render_errors.emplace_back(message, loc, original_text);
+    } else {
+      INJA_THROW(RenderError(message, loc));
+    }
   }
 
   void make_result(const json&& result) {
@@ -2265,11 +2331,11 @@ class Renderer : public NodeVisitor {
       data_eval_stack.pop();
 
       if (!result[N - i - 1]) {
-        const auto data_node = not_found_stack.top();
+        const auto not_found = not_found_stack.top();
         not_found_stack.pop();
 
         if (throw_not_found) {
-          throw_renderer_error("variable '" + static_cast<std::string>(data_node->name) + "' not found", *data_node);
+          throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node);
         }
       }
     }
@@ -2292,11 +2358,11 @@ class Renderer : public NodeVisitor {
       data_eval_stack.pop();
 
       if (!result[N - i - 1]) {
-        const auto data_node = not_found_stack.top();
+        const auto not_found = not_found_stack.top();
         not_found_stack.pop();
 
         if (throw_not_found) {
-          throw_renderer_error("variable '" + static_cast<std::string>(data_node->name) + "' not found", *data_node);
+          throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node);
         }
       }
     }
@@ -2338,7 +2404,7 @@ class Renderer : public NodeVisitor {
         data_eval_stack.push(value.get());
       } else {
         data_eval_stack.push(nullptr);
-        not_found_stack.emplace(&node);
+        not_found_stack.emplace(static_cast<std::string>(node.name), &node);
       }
     }
   }
@@ -2436,10 +2502,10 @@ class Renderer : public NodeVisitor {
       if (not_found_stack.empty()) {
         throw_renderer_error("could not find element with given name", node);
       }
-      const auto id_node = not_found_stack.top();
+      const auto not_found = not_found_stack.top();
       not_found_stack.pop();
       data_eval_stack.pop();
-      data_eval_stack.push(&container->at(id_node->name));
+      data_eval_stack.push(&container->at(not_found.name));
     } break;
     case Op::At: {
       const auto args = get_arguments<2>(node);
@@ -2564,8 +2630,14 @@ class Renderer : public NodeVisitor {
       make_result(get_arguments<1>(node)[0]->is_string());
     } break;
     case Op::Callback: {
-      auto args = get_argument_vector(node);
-      make_result(node.callback(args));
+      if (!node.callback && config.graceful_errors) {
+        // Unknown function without callback in graceful mode
+        data_eval_stack.push(nullptr);
+        not_found_stack.emplace(node.name, &node);
+      } else {
+        auto args = get_argument_vector(node);
+        make_result(node.callback(args));
+      }
     } break;
     case Op::Super: {
       const auto args = get_argument_vector(node);
@@ -2612,13 +2684,25 @@ class Renderer : public NodeVisitor {
       }
       make_result(os.str());
     } break;
-    case Op::None:
-      break;
+    case Op::None: {
+      // Unknown function in graceful error mode
+      if (config.graceful_errors) {
+        // Push nullptr to trigger graceful error handling
+        data_eval_stack.push(nullptr);
+        not_found_stack.emplace(node.name, &node);
+      }
+    } break;
     }
   }
 
   void visit(const ExpressionListNode& node) {
-    print_data(eval_expression_list(node));
+    auto result = eval_expression_list(node);
+    if (result) {
+      print_data(result);
+    } else if (config.graceful_errors && node.length > 0) {
+      // In graceful mode, output the original template text
+      *output_stream << current_template->content.substr(node.pos, node.length);
+    }
   }
 
   void visit(const StatementNode&) {}
@@ -2772,6 +2856,14 @@ public:
 
     data_tmp_stack.clear();
   }
+  
+  const std::vector<RenderErrorInfo>& get_render_errors() const {
+    return render_errors;
+  }
+  
+  void clear_render_errors() {
+    render_errors.clear();
+  }
 };
 
 } // namespace inja
@@ -2791,6 +2883,7 @@ namespace inja {
 class Environment {
   FunctionStorage function_storage;
   TemplateStorage template_storage;
+  std::vector<RenderErrorInfo> last_render_errors; // Track errors from last render
 
 protected:
   LexerConfig lexer_config;
@@ -2922,12 +3015,30 @@ public:
   }
 
   std::ostream& render_to(std::ostream& os, const Template& tmpl, const json& data) {
-    Renderer(render_config, template_storage, function_storage).render_to(os, tmpl, data);
+    Renderer renderer(render_config, template_storage, function_storage);
+    renderer.render_to(os, tmpl, data);
+    last_render_errors = renderer.get_render_errors();
     return os;
   }
 
   std::ostream& render_to(std::ostream& os, const std::string_view input, const json& data) {
     return render_to(os, parse(input), data);
+  }
+  
+  /// Gets the errors from the last render operation (only populated in graceful_errors mode)
+  const std::vector<RenderErrorInfo>& get_last_render_errors() const {
+    return last_render_errors;
+  }
+  
+  /// Clears the stored render errors
+  void clear_render_errors() {
+    last_render_errors.clear();
+  }
+  
+  /// Sets whether to use graceful error handling (missing variables/functions render as original text)
+  void set_graceful_errors(bool graceful) {
+    parser_config.graceful_errors = graceful;
+    render_config.graceful_errors = graceful;
   }
 
   std::string load_file(const std::string& filename) {

@@ -27,7 +27,7 @@ TEST_CASE("types") {
   SUBCASE("basic") {
     CHECK(env.render("", data) == "");
     CHECK(env.render("Hello World!", data) == "Hello World!");
-    CHECK_THROWS_WITH(env.render("{{ }}", data), "[inja.exception.render_error] (at 1:4) empty expression");
+    CHECK_THROWS_WITH(env.render("{{ }}", data), "[inja.exception.render_error] (at 1:1) empty expression");
     CHECK_THROWS_WITH(env.render("{{", data), "[inja.exception.parser_error] (at 1:3) expected expression close, got '<eof>'");
   }
 
@@ -259,6 +259,215 @@ TEST_CASE("templates") {
     CHECK(env.render("{% if is_happy %}{{ name }}{% endif %}   \n.", data) == "Peter.");
     CHECK(env.render("{%- if is_happy %}{{ name }}{% endif -%}   \n.", data) == "Peter.");
     CHECK(env.render("   {# comment #}   \n.", data) == ".");
+  }
+}
+
+TEST_CASE("graceful error handling") {
+  inja::json data;
+  data["name"] = "Peter";
+  data["city"] = "Brunswick";
+  data["age"] = 29;
+
+  SUBCASE("disabled by default") {
+    inja::Environment env;
+    
+    // By default, missing variables should throw
+    CHECK_THROWS_WITH(env.render("{{unknown}}", data), "[inja.exception.render_error] (at 1:3) variable 'unknown' not found");
+    CHECK_THROWS_WITH(env.render("Hello {{ missing_var }}!", data), "[inja.exception.render_error] (at 1:10) variable 'missing_var' not found");
+  }
+
+  SUBCASE("enabled graceful errors") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    // Missing variables should render as original text
+    CHECK(env.render("{{unknown}}", data) == "{{unknown}}");
+    CHECK(env.render("Hello {{ missing_var }}!", data) == "Hello {{ missing_var }}!");
+    CHECK(env.render("This prompt contains a {{ bad_variable }}!", data) == "This prompt contains a {{ bad_variable }}!");
+    
+    // Mixed valid and invalid variables
+    CHECK(env.render("{{ name }} lives in {{ unknown_city }}", data) == "Peter lives in {{ unknown_city }}");
+    CHECK(env.render("{{ unknown1 }} and {{ name }} and {{ unknown2 }}", data) == "{{ unknown1 }} and Peter and {{ unknown2 }}");
+    
+    // Valid variables should still work normally
+    CHECK(env.render("Hello {{ name }}!", data) == "Hello Peter!");
+    CHECK(env.render("{{ name }} is {{ age }} years old.", data) == "Peter is 29 years old.");
+  }
+
+  SUBCASE("error tracking") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    // Clear any previous errors
+    env.clear_render_errors();
+    
+    // Render with missing variable
+    auto result = env.render("Hello {{ missing_var }}!", data);
+    CHECK(result == "Hello {{ missing_var }}!");
+    
+    // Check that error was tracked
+    const auto& errors = env.get_last_render_errors();
+    CHECK(errors.size() == 1);
+    CHECK(errors[0].message == "variable 'missing_var' not found");
+    CHECK(errors[0].original_text == "{{ missing_var }}");
+    CHECK(errors[0].location.line == 1);
+    CHECK(errors[0].location.column == 10);
+  }
+
+  SUBCASE("multiple errors") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    env.clear_render_errors();
+    
+    // Render with multiple missing variables
+    auto result = env.render("{{ var1 }} and {{ name }} and {{ var2 }} and {{ var3 }}", data);
+    CHECK(result == "{{ var1 }} and Peter and {{ var2 }} and {{ var3 }}");
+    
+    // Check that all errors were tracked
+    const auto& errors = env.get_last_render_errors();
+    CHECK(errors.size() == 3);
+    CHECK(errors[0].message == "variable 'var1' not found");
+    CHECK(errors[1].message == "variable 'var2' not found");
+    CHECK(errors[2].message == "variable 'var3' not found");
+  }
+
+  SUBCASE("whitespace preservation") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    // Different whitespace patterns should be preserved
+    CHECK(env.render("{{  unknown  }}", data) == "{{  unknown  }}");
+    CHECK(env.render("{{ unknown}}", data) == "{{ unknown}}");
+    CHECK(env.render("{{unknown }}", data) == "{{unknown }}");
+  }
+
+  SUBCASE("error clearing between renders") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    // First render with error
+    env.render("{{ unknown }}", data);
+    CHECK(env.get_last_render_errors().size() == 1);
+    
+    // Second render without error
+    env.render("{{ name }}", data);
+    CHECK(env.get_last_render_errors().size() == 0);
+    
+    // Third render with error again
+    env.render("{{ unknown }}", data);
+    CHECK(env.get_last_render_errors().size() == 1);
+  }
+
+  SUBCASE("nested variables") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    inja::json nested_data;
+    nested_data["user"]["name"] = "Alice";
+    
+    // Missing nested variable
+    CHECK(env.render("{{ user.email }}", nested_data) == "{{ user.email }}");
+    
+    // Missing parent variable
+    CHECK(env.render("{{ company.name }}", nested_data) == "{{ company.name }}");
+    
+    // Valid nested variable
+    CHECK(env.render("{{ user.name }}", nested_data) == "Alice");
+  }
+
+  SUBCASE("graceful errors in loops") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    inja::json loop_data;
+    loop_data["items"] = inja::json::array({
+      {{"name", "Item1"}},
+      {{"name", "Item2"}},
+      {{"name", "Item3"}}
+    });
+    
+    // Missing variable inside loop should be preserved
+    std::string result = env.render("{% for item in items %}{{ item.name }}: {{ item.price }}, {% endfor %}", loop_data);
+    CHECK(result == "Item1: {{ item.price }}, Item2: {{ item.price }}, Item3: {{ item.price }}, ");
+    
+    // Should track errors for each missing variable
+    const auto& errors = env.get_last_render_errors();
+    CHECK(errors.size() == 3);
+  }
+
+  SUBCASE("graceful errors in conditionals") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    // Missing variable in conditional expression (short-circuit should still work)
+    CHECK(env.render("{% if 0 and undefined %}do{% else %}nothing{% endif %}", data) == "nothing");
+    
+    // Missing variable in output within conditional
+    CHECK(env.render("{% if age > 25 %}{{ name }} is {{ status }}{% endif %}", data) == "Peter is {{ status }}");
+  }
+
+  SUBCASE("complex template with graceful errors") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    std::string tmpl = R"(
+Name: {{ name }}
+Age: {{ age }}
+Email: {{ email }}
+City: {{ city }}
+Country: {{ country }}
+)";
+    
+    std::string expected = R"(
+Name: Peter
+Age: 29
+Email: {{ email }}
+City: Brunswick
+Country: {{ country }}
+)";
+    
+    CHECK(env.render(tmpl, data) == expected);
+    
+    const auto& errors = env.get_last_render_errors();
+    CHECK(errors.size() == 2);
+  }
+
+  SUBCASE("graceful errors with missing functions") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    // Register a known function
+    env.add_callback("double", 1, [](inja::Arguments& args) -> inja::json {
+      return args[0]->get<int>() * 2;
+    });
+    
+    // Missing function should render as original text
+    CHECK(env.render("{{ unknown_func(name) }}", data) == "{{ unknown_func(name) }}");
+    CHECK(env.render("Result: {{ missing() }}", data) == "Result: {{ missing() }}");
+    
+    // Mix of valid and invalid functions
+    CHECK(env.render("{{ double(age) }} and {{ triple(age) }}", data) == "58 and {{ triple(age) }}");
+    
+    // Check error tracking for missing function
+    env.clear_render_errors();
+    env.render("{{ nonexistent(name) }}", data);
+    const auto& errors = env.get_last_render_errors();
+    CHECK(errors.size() == 1);
+    CHECK(errors[0].message == "variable 'nonexistent' not found");
+    CHECK(errors[0].original_text == "{{ nonexistent(name) }}");
+  }
+
+  SUBCASE("graceful errors with mixed missing variables and functions") {
+    inja::Environment env;
+    env.set_graceful_errors(true);
+    
+    // Mix of missing variables and missing functions
+    std::string result = env.render("{{ name }}, {{ missing_var }}, {{ unknown_func() }}", data);
+    CHECK(result == "Peter, {{ missing_var }}, {{ unknown_func() }}");
+    
+    // Should track both types of errors
+    const auto& errors = env.get_last_render_errors();
+    CHECK(errors.size() == 2);
   }
 }
 

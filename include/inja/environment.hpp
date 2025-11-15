@@ -24,6 +24,7 @@ namespace inja {
 class Environment {
   FunctionStorage function_storage;
   TemplateStorage template_storage;
+  std::vector<RenderErrorInfo> last_render_errors; // Track errors from last render
 
 protected:
   LexerConfig lexer_config;
@@ -155,12 +156,30 @@ public:
   }
 
   std::ostream& render_to(std::ostream& os, const Template& tmpl, const json& data) {
-    Renderer(render_config, template_storage, function_storage).render_to(os, tmpl, data);
+    Renderer renderer(render_config, template_storage, function_storage);
+    renderer.render_to(os, tmpl, data);
+    last_render_errors = renderer.get_render_errors();
     return os;
   }
 
   std::ostream& render_to(std::ostream& os, const std::string_view input, const json& data) {
     return render_to(os, parse(input), data);
+  }
+  
+  /// Gets the errors from the last render operation (only populated in graceful_errors mode)
+  const std::vector<RenderErrorInfo>& get_last_render_errors() const {
+    return last_render_errors;
+  }
+  
+  /// Clears the stored render errors
+  void clear_render_errors() {
+    last_render_errors.clear();
+  }
+  
+  /// Sets whether to use graceful error handling (missing variables/functions render as original text)
+  void set_graceful_errors(bool graceful) {
+    parser_config.graceful_errors = graceful;
+    render_config.graceful_errors = graceful;
   }
 
   std::string load_file(const std::string& filename) {

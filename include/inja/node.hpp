@@ -255,6 +255,7 @@ public:
 class ExpressionListNode : public AstNode {
 public:
   std::shared_ptr<ExpressionNode> root;
+  size_t length {0}; // Length of the expression in the template (including delimiters)
 
   explicit ExpressionListNode(): AstNode(0) {}
   explicit ExpressionListNode(size_t pos): AstNode(pos) {}

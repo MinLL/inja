@@ -231,11 +231,16 @@ class Parser {
 
           auto function_data = function_storage.find_function(func->name, func->number_args);
           if (function_data.operation == FunctionStorage::Operation::None) {
-            throw_parser_error("unknown function " + func->name);
-          }
-          func->operation = function_data.operation;
-          if (function_data.operation == FunctionStorage::Operation::Callback) {
-            func->callback = function_data.callback;
+            if (!config.graceful_errors) {
+              throw_parser_error("unknown function " + func->name);
+            }
+            // In graceful mode, explicitly set operation to None to be handled at render time
+            func->operation = FunctionStorage::Operation::None;
+          } else {
+            func->operation = function_data.operation;
+            if (function_data.operation == FunctionStorage::Operation::Callback) {
+              func->callback = function_data.callback;
+            }
           }
           arguments.emplace_back(func);
 
@@ -597,15 +602,20 @@ class Parser {
         }
       } break;
       case Token::Kind::ExpressionOpen: {
+        const size_t expr_start = tok.text.data() - tmpl.content.c_str();
         get_next_token();
 
-        auto expression_list_node = std::make_shared<ExpressionListNode>(tok.text.data() - tmpl.content.c_str());
+        auto expression_list_node = std::make_shared<ExpressionListNode>(expr_start);
         current_block->nodes.emplace_back(expression_list_node);
         current_expression_list = expression_list_node.get();
 
         if (!parse_expression(tmpl, Token::Kind::ExpressionClose)) {
           throw_parser_error("expected expression close, got '" + tok.describe() + "'");
         }
+        
+        // Calculate the length of the expression including delimiters
+        const size_t expr_end = tok.text.data() - tmpl.content.c_str() + tok.text.length();
+        current_expression_list->length = expr_end - expr_start;
       } break;
       case Token::Kind::CommentOpen: {
         get_next_token();

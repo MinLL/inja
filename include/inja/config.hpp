@@ -66,6 +66,7 @@ struct LexerConfig {
  */
 struct ParserConfig {
   bool search_included_templates_in_files {true};
+  bool graceful_errors {false}; // If true, allow unknown functions at parse time
 
   std::function<Template(const std::filesystem::path&, const std::string&)> include_callback;
 };
@@ -76,6 +77,7 @@ struct ParserConfig {
 struct RenderConfig {
   bool throw_at_missing_includes {true};
   bool html_autoescape {false};
+  bool graceful_errors {false}; // If true, missing variables/functions render as original template text
 };
 
 } // namespace inja
