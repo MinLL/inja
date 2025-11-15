@@ -1,0 +1,5 @@
+Name: inja
+Description: Template engine for modern C++
+URL: https://github.com/pantor/inja
+Version: 3.5.0
+Requires: nlohmann_json
