@@ -504,10 +504,14 @@ class Renderer : public NodeVisitor {
       make_result(get_arguments<1>(node)[0]->is_string());
     } break;
     case Op::Callback: {
-      if (!node.callback && config.graceful_errors) {
-        // Unknown function without callback in graceful mode
-        data_eval_stack.push(nullptr);
-        not_found_stack.emplace(node.name, &node);
+      if (!node.callback) {
+        if (config.graceful_errors) {
+          // Unknown function without callback in graceful mode
+          data_eval_stack.push(nullptr);
+          not_found_stack.emplace(node.name, &node);
+        } else {
+          throw_renderer_error("callback function is not set", node);
+        }
       } else {
         auto args = get_argument_vector(node);
         make_result(node.callback(args));
