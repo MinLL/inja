@@ -388,11 +388,16 @@ class Parser {
         // search store for defined function with such name and number of args
         auto function_data = function_storage.find_function(func->name, func->number_args);
         if (function_data.operation == FunctionStorage::Operation::None) {
-          throw_parser_error("unknown function " + func->name);
-        }
-        func->operation = function_data.operation;
-        if (function_data.operation == FunctionStorage::Operation::Callback) {
-          func->callback = function_data.callback;
+          if (!config.graceful_errors) {
+            throw_parser_error("unknown function " + func->name);
+          }
+          // In graceful mode, explicitly set operation to None to be handled at render time
+          func->operation = FunctionStorage::Operation::None;
+        } else {
+          func->operation = function_data.operation;
+          if (function_data.operation == FunctionStorage::Operation::Callback) {
+            func->callback = function_data.callback;
+          }
         }
         arguments.emplace_back(func);
       } break;

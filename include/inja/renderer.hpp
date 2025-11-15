@@ -570,7 +570,13 @@ class Renderer : public NodeVisitor {
   }
 
   void visit(const ExpressionListNode& node) override {
-    print_data(eval_expression_list(node));
+    auto result = eval_expression_list(node);
+    if (result) {
+      print_data(result);
+    } else if (config.graceful_errors && node.length > 0) {
+      // In graceful mode, output the original template text
+      *output_stream << current_template->content.substr(node.pos, node.length);
+    }
   }
 
   void visit(const StatementNode&) override {}
