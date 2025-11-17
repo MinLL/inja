@@ -2945,7 +2945,8 @@ class Renderer : public NodeVisitor {
 
   void visit(const IfStatementNode& node) override {
     const auto result = eval_expression_list(node.condition);
-    if (truthy(result.get())) {
+    // In graceful error mode, result can be nullptr if variable is missing
+    if (result && truthy(result.get())) {
       node.true_statement.accept(*this);
     } else if (node.has_false_statement) {
       node.false_statement.accept(*this);

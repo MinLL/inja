@@ -84,6 +84,10 @@ class Renderer : public NodeVisitor {
   std::vector<RenderErrorInfo> render_errors; // Track errors in graceful mode
 
   static bool truthy(const json* data) {
+    // In graceful error mode, data can be nullptr for missing variables
+    if (!data) {
+      return false;
+    }
     if (data->is_boolean()) {
       return data->get<bool>();
     } else if (data->is_number()) {
@@ -204,6 +208,11 @@ class Renderer : public NodeVisitor {
 
         if (throw_not_found) {
           throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node);
+          // In graceful error mode, provide a safe default instead of nullptr
+          if (config.graceful_errors) {
+            static const json empty_json;
+            result[N - i - 1] = &empty_json;
+          }
         }
       }
     }
@@ -231,6 +240,11 @@ class Renderer : public NodeVisitor {
 
         if (throw_not_found) {
           throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node);
+          // In graceful error mode, provide a safe default instead of nullptr
+          if (config.graceful_errors) {
+            static const json empty_json;
+            result[N - i - 1] = &empty_json;
+          }
         }
       }
     }
@@ -585,6 +599,13 @@ class Renderer : public NodeVisitor {
 
   void visit(const ForArrayStatementNode& node) override {
     const auto result = eval_expression_list(node.condition);
+    // In graceful error mode, result can be nullptr if variable is missing
+    if (!result) {
+      if (config.graceful_errors) {
+        return; // Skip the loop if variable is missing in graceful mode
+      }
+      throw_renderer_error("expression could not be evaluated", node);
+    }
     if (!result->is_array()) {
       throw_renderer_error("object must be an array", node);
     }
@@ -624,6 +645,13 @@ class Renderer : public NodeVisitor {
 
   void visit(const ForObjectStatementNode& node) override {
     const auto result = eval_expression_list(node.condition);
+    // In graceful error mode, result can be nullptr if variable is missing
+    if (!result) {
+      if (config.graceful_errors) {
+        return; // Skip the loop if variable is missing in graceful mode
+      }
+      throw_renderer_error("expression could not be evaluated", node);
+    }
     if (!result->is_object()) {
       throw_renderer_error("object must be an object", node);
     }
@@ -663,7 +691,8 @@ class Renderer : public NodeVisitor {
 
   void visit(const IfStatementNode& node) override {
     const auto result = eval_expression_list(node.condition);
-    if (truthy(result.get())) {
+    // In graceful error mode, result can be nullptr if variable is missing
+    if (result && truthy(result.get())) {
       node.true_statement.accept(*this);
     } else if (node.has_false_statement) {
       node.false_statement.accept(*this);
