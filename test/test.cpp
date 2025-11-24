@@ -13,6 +13,7 @@
 #include "test-graceful-errors.cpp"
 #include "test-array-functions.cpp"
 #include "test-elif-raw.cpp"
+#include "test-variable-crashes.cpp"
 
 #define xstr(s) str(s)
 #define str(s) #s

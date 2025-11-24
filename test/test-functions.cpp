@@ -193,8 +193,8 @@ TEST_CASE("functions") {
     CHECK(env.render("{{ existsIn(brother, \"parents\") }}", data) == "false");
     CHECK(env.render("{{ existsIn(brother, property) }}", data) == "true");
     CHECK(env.render("{{ existsIn(brother, name) }}", data) == "false");
-    CHECK_THROWS_WITH(env.render("{{ existsIn(sister, \"lastname\") }}", data), "[inja.exception.render_error] (at 1:13) variable 'sister' not found");
-    CHECK_THROWS_WITH(env.render("{{ existsIn(brother, sister) }}", data), "[inja.exception.render_error] (at 1:22) variable 'sister' not found");
+    CHECK_THROWS_WITH(env.render("{{ existsIn(sister, \"lastname\") }}", data), "[inja.exception.render_error] (at 1:4) operation 'existsIn' failed: [inja.exception.render_error] (at 1:13) variable 'sister' not found");
+    CHECK_THROWS_WITH(env.render("{{ existsIn(brother, sister) }}", data), "[inja.exception.render_error] (at 1:4) operation 'existsIn' failed: [inja.exception.render_error] (at 1:22) variable 'sister' not found");
   }
 
   SUBCASE("join") {

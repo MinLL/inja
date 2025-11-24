@@ -210,12 +210,14 @@ class Renderer : public NodeVisitor {
           throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node);
         }
         
-        // In graceful error mode, always provide a safe default instead of nullptr
-        // This prevents null pointer dereferences even when throw_not_found is false
-        if (config.graceful_errors) {
+        // In graceful error mode, provide a safe default to prevent null pointer dereferences
+        // But only when the caller expects to throw - if throw_not_found is false, the caller
+        // explicitly wants to handle nullptr (e.g., the Default filter)
+        if (config.graceful_errors && throw_not_found) {
           static const json empty_json;
           result[N - i - 1] = &empty_json;
         }
+        // If throw_not_found is false, leave as nullptr so caller can detect missing value
       }
     }
     return result;
@@ -244,12 +246,14 @@ class Renderer : public NodeVisitor {
           throw_renderer_error("variable '" + not_found.name + "' not found", *not_found.node);
         }
         
-        // In graceful error mode, always provide a safe default instead of nullptr
-        // This prevents null pointer dereferences even when throw_not_found is false
-        if (config.graceful_errors) {
+        // In graceful error mode, provide a safe default to prevent null pointer dereferences
+        // But only when the caller expects to throw - if throw_not_found is false, the caller
+        // explicitly wants to handle nullptr (e.g., the Default filter)
+        if (config.graceful_errors && throw_not_found) {
           static const json empty_json;
           result[N - i - 1] = &empty_json;
         }
+        // If throw_not_found is false, leave as nullptr so caller can detect missing value
       }
     }
     return result;
@@ -387,25 +391,31 @@ class Renderer : public NodeVisitor {
       INJA_OP_TRY_END_GRACEFUL("multiply")
     } break;
     case Op::Division: {
-      const auto args = get_arguments<2>(node);
-      if (args[1]->get<const json::number_float_t>() == 0) {
-        throw_renderer_error("division by zero", node);
-      }
-      make_result(args[0]->get<const json::number_float_t>() / args[1]->get<const json::number_float_t>());
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<2>(node);
+        if (args[1]->get<const json::number_float_t>() == 0) {
+          throw_renderer_error("division by zero", node);
+        }
+        make_result(args[0]->get<const json::number_float_t>() / args[1]->get<const json::number_float_t>());
+      INJA_OP_TRY_END_GRACEFUL("division")
     } break;
     case Op::Power: {
-      const auto args = get_arguments<2>(node);
-      if (args[0]->is_number_integer() && args[1]->get<const json::number_integer_t>() >= 0) {
-        const auto result = static_cast<json::number_integer_t>(std::pow(args[0]->get<const json::number_integer_t>(), args[1]->get<const json::number_integer_t>()));
-        make_result(result);
-      } else {
-        const auto result = std::pow(args[0]->get<const json::number_float_t>(), args[1]->get<const json::number_integer_t>());
-        make_result(result);
-      }
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<2>(node);
+        if (args[0]->is_number_integer() && args[1]->get<const json::number_integer_t>() >= 0) {
+          const auto result = static_cast<json::number_integer_t>(std::pow(args[0]->get<const json::number_integer_t>(), args[1]->get<const json::number_integer_t>()));
+          make_result(result);
+        } else {
+          const auto result = std::pow(args[0]->get<const json::number_float_t>(), args[1]->get<const json::number_integer_t>());
+          make_result(result);
+        }
+      INJA_OP_TRY_END_GRACEFUL("power")
     } break;
     case Op::Modulo: {
-      const auto args = get_arguments<2>(node);
-      make_result(args[0]->get<const json::number_integer_t>() % args[1]->get<const json::number_integer_t>());
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<2>(node);
+        make_result(args[0]->get<const json::number_integer_t>() % args[1]->get<const json::number_integer_t>());
+      INJA_OP_TRY_END_GRACEFUL("modulo")
     } break;
     case Op::AtId: {
       const auto container = get_arguments<1, 0, false>(node)[0];
@@ -496,21 +506,29 @@ class Renderer : public NodeVisitor {
       data_eval_stack.push((test_arg != nullptr) ? test_arg : get_arguments<1, 1>(node)[0]);
     } break;
     case Op::DivisibleBy: {
-      const auto args = get_arguments<2>(node);
-      const auto divisor = args[1]->get<const json::number_integer_t>();
-      make_result((divisor != 0) && (args[0]->get<const json::number_integer_t>() % divisor == 0));
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<2>(node);
+        const auto divisor = args[1]->get<const json::number_integer_t>();
+        make_result((divisor != 0) && (args[0]->get<const json::number_integer_t>() % divisor == 0));
+      INJA_OP_TRY_END_GRACEFUL("divisibleBy")
     } break;
     case Op::Even: {
-      make_result(get_arguments<1>(node)[0]->get<const json::number_integer_t>() % 2 == 0);
+      INJA_OP_TRY_BEGIN
+        make_result(get_arguments<1>(node)[0]->get<const json::number_integer_t>() % 2 == 0);
+      INJA_OP_TRY_END_GRACEFUL("even")
     } break;
     case Op::Exists: {
-      auto&& name = get_arguments<1>(node)[0]->get_ref<const json::string_t&>();
-      make_result(data_input->contains(json::json_pointer(DataNode::convert_dot_to_ptr(name))));
+      INJA_OP_TRY_BEGIN
+        auto&& name = get_arguments<1>(node)[0]->get_ref<const json::string_t&>();
+        make_result(data_input->contains(json::json_pointer(DataNode::convert_dot_to_ptr(name))));
+      INJA_OP_TRY_END_GRACEFUL("exists")
     } break;
     case Op::ExistsInObject: {
-      const auto args = get_arguments<2>(node);
-      auto&& name = args[1]->get_ref<const json::string_t&>();
-      make_result(args[0]->find(name) != args[0]->end());
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<2>(node);
+        auto&& name = args[1]->get_ref<const json::string_t&>();
+        make_result(args[0]->find(name) != args[0]->end());
+      INJA_OP_TRY_END_GRACEFUL("existsIn")
     } break;
     case Op::First: {
       INJA_OP_TRY_BEGIN
@@ -529,10 +547,14 @@ class Renderer : public NodeVisitor {
       INJA_OP_TRY_END_GRACEFUL("first")
     } break;
     case Op::Float: {
-      make_result(std::stod(get_arguments<1>(node)[0]->get_ref<const json::string_t&>()));
+      INJA_OP_TRY_BEGIN
+        make_result(std::stod(get_arguments<1>(node)[0]->get_ref<const json::string_t&>()));
+      INJA_OP_TRY_END_GRACEFUL("float")
     } break;
     case Op::Int: {
-      make_result(std::stoi(get_arguments<1>(node)[0]->get_ref<const json::string_t&>()));
+      INJA_OP_TRY_BEGIN
+        make_result(std::stoi(get_arguments<1>(node)[0]->get_ref<const json::string_t&>()));
+      INJA_OP_TRY_END_GRACEFUL("int")
     } break;
     case Op::Last: {
       INJA_OP_TRY_BEGIN
@@ -551,12 +573,14 @@ class Renderer : public NodeVisitor {
       INJA_OP_TRY_END_GRACEFUL("last")
     } break;
     case Op::Length: {
-      const auto val = get_arguments<1>(node)[0];
-      if (val->is_string()) {
-        make_result(val->get_ref<const json::string_t&>().length());
-      } else {
-        make_result(val->size());
-      }
+      INJA_OP_TRY_BEGIN
+        const auto val = get_arguments<1>(node)[0];
+        if (val->is_string()) {
+          make_result(val->get_ref<const json::string_t&>().length());
+        } else {
+          make_result(val->size());
+        }
+      INJA_OP_TRY_END_GRACEFUL("length")
     } break;
     case Op::Lower: {
       INJA_OP_TRY_BEGIN
@@ -566,22 +590,30 @@ class Renderer : public NodeVisitor {
       INJA_OP_TRY_END_GRACEFUL("lower")
     } break;
     case Op::Max: {
-      const auto args = get_arguments<1>(node);
-      const auto result = std::max_element(args[0]->begin(), args[0]->end());
-      data_eval_stack.push(&(*result));
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<1>(node);
+        const auto result = std::max_element(args[0]->begin(), args[0]->end());
+        data_eval_stack.push(&(*result));
+      INJA_OP_TRY_END_GRACEFUL("max")
     } break;
     case Op::Min: {
-      const auto args = get_arguments<1>(node);
-      const auto result = std::min_element(args[0]->begin(), args[0]->end());
-      data_eval_stack.push(&(*result));
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<1>(node);
+        const auto result = std::min_element(args[0]->begin(), args[0]->end());
+        data_eval_stack.push(&(*result));
+      INJA_OP_TRY_END_GRACEFUL("min")
     } break;
     case Op::Odd: {
-      make_result(get_arguments<1>(node)[0]->get<const json::number_integer_t>() % 2 != 0);
+      INJA_OP_TRY_BEGIN
+        make_result(get_arguments<1>(node)[0]->get<const json::number_integer_t>() % 2 != 0);
+      INJA_OP_TRY_END_GRACEFUL("odd")
     } break;
     case Op::Range: {
-      std::vector<int> result(get_arguments<1>(node)[0]->get<const json::number_integer_t>());
-      std::iota(result.begin(), result.end(), 0);
-      make_result(std::move(result));
+      INJA_OP_TRY_BEGIN
+        std::vector<int> result(get_arguments<1>(node)[0]->get<const json::number_integer_t>());
+        std::iota(result.begin(), result.end(), 0);
+        make_result(std::move(result));
+      INJA_OP_TRY_END_GRACEFUL("range")
     } break;
     case Op::Replace: {
       INJA_OP_TRY_BEGIN
@@ -592,20 +624,24 @@ class Renderer : public NodeVisitor {
       INJA_OP_TRY_END_GRACEFUL("replace")
     } break;
     case Op::Round: {
-      const auto args = get_arguments<2>(node);
-      const auto precision = args[1]->get<const json::number_integer_t>();
-      const double result = std::round(args[0]->get<const json::number_float_t>() * std::pow(10.0, precision)) / std::pow(10.0, precision);
-      if (precision == 0) {
-        make_result(static_cast<int>(result));
-      } else {
-        make_result(result);
-      }
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<2>(node);
+        const auto precision = args[1]->get<const json::number_integer_t>();
+        const double result = std::round(args[0]->get<const json::number_float_t>() * std::pow(10.0, precision)) / std::pow(10.0, precision);
+        if (precision == 0) {
+          make_result(static_cast<int>(result));
+        } else {
+          make_result(result);
+        }
+      INJA_OP_TRY_END_GRACEFUL("round")
     } break;
     case Op::Sort: {
-      auto result_ptr = std::make_shared<json>(get_arguments<1>(node)[0]->get<std::vector<json>>());
-      std::sort(result_ptr->begin(), result_ptr->end());
-      data_tmp_stack.push_back(result_ptr);
-      data_eval_stack.push(result_ptr.get());
+      INJA_OP_TRY_BEGIN
+        auto result_ptr = std::make_shared<json>(get_arguments<1>(node)[0]->get<std::vector<json>>());
+        std::sort(result_ptr->begin(), result_ptr->end());
+        data_tmp_stack.push_back(result_ptr);
+        data_eval_stack.push(result_ptr.get());
+      INJA_OP_TRY_END_GRACEFUL("sort")
     } break;
     case Op::Upper: {
       INJA_OP_TRY_BEGIN
@@ -680,20 +716,22 @@ class Renderer : public NodeVisitor {
       make_result(nullptr);
     } break;
     case Op::Join: {
-      const auto args = get_arguments<2>(node);
-      const auto separator = args[1]->get<json::string_t>();
-      std::ostringstream os;
-      std::string sep;
-      for (const auto& value : *args[0]) {
-        os << sep;
-        if (value.is_string()) {
-          os << value.get<std::string>(); // otherwise the value is surrounded with ""
-        } else {
-          os << value.dump();
+      INJA_OP_TRY_BEGIN
+        const auto args = get_arguments<2>(node);
+        const auto separator = args[1]->get<json::string_t>();
+        std::ostringstream os;
+        std::string sep;
+        for (const auto& value : *args[0]) {
+          os << sep;
+          if (value.is_string()) {
+            os << value.get<std::string>(); // otherwise the value is surrounded with ""
+          } else {
+            os << value.dump();
+          }
+          sep = separator;
         }
-        sep = separator;
-      }
-      make_result(os.str());
+        make_result(os.str());
+      INJA_OP_TRY_END_GRACEFUL("join")
     } break;
     case Op::None: {
       // Unknown function in graceful error mode
