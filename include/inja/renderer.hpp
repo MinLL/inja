@@ -289,7 +289,15 @@ class Renderer : public NodeVisitor {
       const auto function_data = function_storage.find_function(node.name, 0);
       if (function_data.operation == FunctionStorage::Operation::Callback) {
         Arguments empty_args {};
-        const auto value = std::make_shared<json>(function_data.callback(empty_args));
+        // If a callback wrapper is set (for tracing/instrumentation), use it
+        std::shared_ptr<json> value;
+        if (config.callback_wrapper) {
+          value = std::make_shared<json>(config.callback_wrapper(static_cast<std::string>(node.name), empty_args, [&]() {
+            return function_data.callback(empty_args);
+          }));
+        } else {
+          value = std::make_shared<json>(function_data.callback(empty_args));
+        }
         data_tmp_stack.push_back(value);
         data_eval_stack.push(value.get());
       } else {
@@ -683,7 +691,14 @@ class Renderer : public NodeVisitor {
         }
       } else {
         auto args = get_argument_vector(node);
-        make_result(node.callback(args));
+        // If a callback wrapper is set (for tracing/instrumentation), use it
+        if (config.callback_wrapper) {
+          make_result(config.callback_wrapper(node.name, args, [&]() {
+            return node.callback(args);
+          }));
+        } else {
+          make_result(node.callback(args));
+        }
       }
     } break;
     case Op::Super: {

@@ -6,8 +6,21 @@
 #include <string>
 
 #include "template.hpp"
+#include "json.hpp"
 
 namespace inja {
+
+/*!
+ * \brief Type for callback wrapper function used for tracing/instrumentation.
+ * 
+ * The wrapper receives the function name, the arguments passed to the callback,
+ * and a thunk that executes the actual callback.
+ * This allows external code to wrap callback execution with timing, tracing, 
+ * argument logging, return value inspection, etc.
+ * 
+ * Usage: wrapper("function_name", args, [&]() { return actual_callback(args); })
+ */
+using CallbackWrapper = std::function<json(const std::string& function_name, const Arguments& args, const std::function<json()>& callback_thunk)>;
 
 /*!
  * \brief Class for lexer configuration.
@@ -78,6 +91,24 @@ struct RenderConfig {
   bool throw_at_missing_includes {true};
   bool html_autoescape {false};
   bool graceful_errors {false}; // If true, missing variables/functions render as original template text
+  
+  /*!
+   * \brief Optional callback wrapper for instrumenting callback execution.
+   * 
+   * When set, all user-defined callbacks will be invoked through this wrapper,
+   * allowing external code to measure timing, add tracing spans, etc.
+   * 
+   * The wrapper receives the callback function name and a thunk that executes
+   * the actual callback. Example usage for tracing:
+   * 
+   * render_config.callback_wrapper = [&](const std::string& name, const std::function<json()>& thunk) {
+   *     auto span = trace_context.StartSpan("decorator:" + name);
+   *     auto result = thunk();
+   *     trace_context.EndSpan(span);
+   *     return result;
+   * };
+   */
+  CallbackWrapper callback_wrapper;
 };
 
 } // namespace inja

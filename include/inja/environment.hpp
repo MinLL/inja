@@ -113,6 +113,32 @@ public:
     render_config.html_autoescape = will_escape;
   }
 
+  /*!
+   * \brief Sets a callback wrapper for instrumenting callback execution.
+   * 
+   * When set, all user-defined callbacks will be invoked through this wrapper,
+   * allowing external code to measure timing, add tracing spans, etc.
+   * Pass an empty/null function to disable wrapping.
+   * 
+   * Example usage for tracing:
+   * @code
+   * env.set_callback_wrapper([&ctx](const std::string& name, const std::function<json()>& thunk) {
+   *     auto span_id = ctx.StartSpan("decorator:" + name);
+   *     auto result = thunk();
+   *     ctx.EndSpan(span_id);
+   *     return result;
+   * });
+   * @endcode
+   */
+  void set_callback_wrapper(const CallbackWrapper& wrapper) {
+    render_config.callback_wrapper = wrapper;
+  }
+  
+  /// Clears the callback wrapper (disables instrumentation)
+  void clear_callback_wrapper() {
+    render_config.callback_wrapper = nullptr;
+  }
+
   Template parse(std::string_view input) {
     Parser parser(parser_config, lexer_config, template_storage, function_storage);
     return parser.parse(input, input_path);

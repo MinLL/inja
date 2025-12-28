@@ -3,6 +3,9 @@
 #include "inja/environment.hpp"
 
 #include "test-common.hpp"
+#include <chrono>
+#include <vector>
+#include <utility>
 
 TEST_CASE("functions") {
   inja::Environment env;
@@ -293,6 +296,256 @@ TEST_CASE("callbacks") {
 
     CHECK(env.render("{{ argmax(4, 2, 6) }}", data) == "2");
     CHECK(env.render("{{ argmax(0, 2, 6, 8, 3) }}", data) == "3");
+  }
+}
+
+TEST_CASE("callback wrapper") {
+  inja::Environment env;
+  inja::json data;
+  data["age"] = 28;
+  data["name"] = "Peter";
+
+  // Track which callbacks were wrapped
+  std::vector<std::string> wrapped_calls;
+
+  // Register some test callbacks
+  env.add_callback("double", 1, [](inja::Arguments& args) {
+    return args.at(0)->get<int>() * 2;
+  });
+
+  env.add_callback("triple", 1, [](inja::Arguments& args) {
+    return args.at(0)->get<int>() * 3;
+  });
+
+  env.add_callback("greet", 0, [](inja::Arguments&) {
+    return "Hello!";
+  });
+
+  SUBCASE("wrapper is called for function callbacks") {
+    wrapped_calls.clear();
+    
+    env.set_callback_wrapper([&wrapped_calls](const std::string& name, const inja::Arguments& args, const std::function<inja::json()>& thunk) {
+      wrapped_calls.push_back(name);
+      return thunk();
+    });
+
+    CHECK(env.render("{{ double(age) }}", data) == "56");
+    CHECK(wrapped_calls.size() == 1);
+    CHECK(wrapped_calls[0] == "double");
+  }
+
+  SUBCASE("wrapper is called for zero-argument callbacks") {
+    wrapped_calls.clear();
+    
+    env.set_callback_wrapper([&wrapped_calls](const std::string& name, const inja::Arguments& args, const std::function<inja::json()>& thunk) {
+      wrapped_calls.push_back(name);
+      CHECK(args.size() == 0);  // Zero-arg callbacks have no args
+      return thunk();
+    });
+
+    // Zero-argument callbacks can be called without parentheses
+    CHECK(env.render("{{ greet }}", data) == "Hello!");
+    CHECK(wrapped_calls.size() == 1);
+    CHECK(wrapped_calls[0] == "greet");
+    
+    wrapped_calls.clear();
+    
+    // Also with explicit parentheses
+    CHECK(env.render("{{ greet() }}", data) == "Hello!");
+    CHECK(wrapped_calls.size() == 1);
+    CHECK(wrapped_calls[0] == "greet");
+  }
+
+  SUBCASE("wrapper receives correct function names for multiple calls") {
+    wrapped_calls.clear();
+    
+    env.set_callback_wrapper([&wrapped_calls](const std::string& name, const inja::Arguments&, const std::function<inja::json()>& thunk) {
+      wrapped_calls.push_back(name);
+      return thunk();
+    });
+
+    CHECK(env.render("{{ double(age) }} and {{ triple(age) }}", data) == "56 and 84");
+    CHECK(wrapped_calls.size() == 2);
+    CHECK(wrapped_calls[0] == "double");
+    CHECK(wrapped_calls[1] == "triple");
+  }
+
+  SUBCASE("wrapper can modify return value") {
+    env.set_callback_wrapper([](const std::string&, const inja::Arguments&, const std::function<inja::json()>& thunk) {
+      auto result = thunk();
+      // Double the result again
+      if (result.is_number_integer()) {
+        return inja::json(result.get<int>() * 2);
+      }
+      return result;
+    });
+
+    // double(28) = 56, then wrapper doubles it again = 112
+    CHECK(env.render("{{ double(age) }}", data) == "112");
+  }
+
+  SUBCASE("wrapper can measure timing") {
+    std::vector<std::pair<std::string, long long>> timings;
+    
+    env.set_callback_wrapper([&timings](const std::string& name, const inja::Arguments&, const std::function<inja::json()>& thunk) {
+      auto start = std::chrono::steady_clock::now();
+      auto result = thunk();
+      auto end = std::chrono::steady_clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+      timings.push_back({name, duration});
+      return result;
+    });
+
+    CHECK(env.render("{{ double(age) }} {{ triple(age) }}", data) == "56 84");
+    CHECK(timings.size() == 2);
+    CHECK(timings[0].first == "double");
+    CHECK(timings[1].first == "triple");
+    // Duration should be non-negative (timing actually happened)
+    CHECK(timings[0].second >= 0);
+    CHECK(timings[1].second >= 0);
+  }
+
+  SUBCASE("clear_callback_wrapper disables wrapping") {
+    wrapped_calls.clear();
+    
+    env.set_callback_wrapper([&wrapped_calls](const std::string& name, const inja::Arguments&, const std::function<inja::json()>& thunk) {
+      wrapped_calls.push_back(name);
+      return thunk();
+    });
+
+    CHECK(env.render("{{ double(age) }}", data) == "56");
+    CHECK(wrapped_calls.size() == 1);
+    
+    wrapped_calls.clear();
+    env.clear_callback_wrapper();
+    
+    CHECK(env.render("{{ double(age) }}", data) == "56");
+    CHECK(wrapped_calls.size() == 0);  // No wrapping occurred
+  }
+
+  SUBCASE("wrapper handles exceptions properly") {
+    env.add_callback("throws", 0, [](inja::Arguments&) -> inja::json {
+      throw std::runtime_error("test exception");
+    });
+
+    bool wrapper_called = false;
+    bool exception_propagated = false;
+    
+    env.set_callback_wrapper([&wrapper_called](const std::string&, const inja::Arguments&, const std::function<inja::json()>& thunk) {
+      wrapper_called = true;
+      return thunk();  // Exception should propagate through
+    });
+
+    try {
+      env.render("{{ throws() }}", data);
+    } catch (const std::exception&) {
+      exception_propagated = true;
+    }
+    
+    CHECK(wrapper_called == true);
+    CHECK(exception_propagated == true);
+  }
+
+  SUBCASE("wrapper works with nested callback calls") {
+    wrapped_calls.clear();
+    
+    env.add_callback("add", 2, [](inja::Arguments& args) {
+      return args.at(0)->get<int>() + args.at(1)->get<int>();
+    });
+
+    env.set_callback_wrapper([&wrapped_calls](const std::string& name, const inja::Arguments&, const std::function<inja::json()>& thunk) {
+      wrapped_calls.push_back(name);
+      return thunk();
+    });
+
+    // double(add(5, 3)) = double(8) = 16
+    CHECK(env.render("{{ double(add(5, 3)) }}", data) == "16");
+    CHECK(wrapped_calls.size() == 2);
+    // Inner callback (add) is called first, then outer (double)
+    CHECK(wrapped_calls[0] == "add");
+    CHECK(wrapped_calls[1] == "double");
+  }
+
+  SUBCASE("wrapper works in loops") {
+    wrapped_calls.clear();
+    
+    env.set_callback_wrapper([&wrapped_calls](const std::string& name, const inja::Arguments&, const std::function<inja::json()>& thunk) {
+      wrapped_calls.push_back(name);
+      return thunk();
+    });
+
+    inja::json loop_data;
+    loop_data["numbers"] = {1, 2, 3};
+
+    CHECK(env.render("{% for n in numbers %}{{ double(n) }}{% endfor %}", loop_data) == "246");
+    CHECK(wrapped_calls.size() == 3);
+    for (const auto& call : wrapped_calls) {
+      CHECK(call == "double");
+    }
+  }
+
+  SUBCASE("wrapper receives correct arguments") {
+    std::vector<std::pair<std::string, std::vector<inja::json>>> recorded_calls;
+    
+    env.add_callback("add", 2, [](inja::Arguments& args) {
+      return args.at(0)->get<int>() + args.at(1)->get<int>();
+    });
+
+    env.set_callback_wrapper([&recorded_calls](const std::string& name, const inja::Arguments& args, const std::function<inja::json()>& thunk) {
+      std::vector<inja::json> arg_values;
+      for (const auto* arg : args) {
+        if (arg) {
+          arg_values.push_back(*arg);
+        }
+      }
+      recorded_calls.push_back({name, arg_values});
+      return thunk();
+    });
+
+    CHECK(env.render("{{ add(5, 10) }}", data) == "15");
+    CHECK(recorded_calls.size() == 1);
+    CHECK(recorded_calls[0].first == "add");
+    CHECK(recorded_calls[0].second.size() == 2);
+    CHECK(recorded_calls[0].second[0] == 5);
+    CHECK(recorded_calls[0].second[1] == 10);
+    
+    recorded_calls.clear();
+    
+    // Test with string argument
+    CHECK(env.render("{{ double(age) }}", data) == "56");
+    CHECK(recorded_calls.size() == 1);
+    CHECK(recorded_calls[0].first == "double");
+    CHECK(recorded_calls[0].second.size() == 1);
+    CHECK(recorded_calls[0].second[0] == 28);  // age value from data
+  }
+
+  SUBCASE("wrapper can inspect and log arguments") {
+    std::vector<std::string> logs;
+    
+    env.add_callback("concat", 2, [](inja::Arguments& args) {
+      return args.at(0)->get<std::string>() + args.at(1)->get<std::string>();
+    });
+
+    env.set_callback_wrapper([&logs](const std::string& name, const inja::Arguments& args, const std::function<inja::json()>& thunk) {
+      std::string log_entry = name + "(";
+      for (size_t i = 0; i < args.size(); ++i) {
+        if (i > 0) log_entry += ", ";
+        if (args[i]) {
+          log_entry += args[i]->dump();
+        }
+      }
+      log_entry += ")";
+      
+      auto result = thunk();
+      log_entry += " -> " + result.dump();
+      logs.push_back(log_entry);
+      
+      return result;
+    });
+
+    CHECK(env.render("{{ concat(name, \"!\") }}", data) == "Peter!");
+    CHECK(logs.size() == 1);
+    CHECK(logs[0] == "concat(\"Peter\", \"!\") -> \"Peter!\"");
   }
 }
 
