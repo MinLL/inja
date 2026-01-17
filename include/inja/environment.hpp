@@ -10,6 +10,7 @@
 
 #include "json.hpp"
 #include "config.hpp"
+#include "callback_cache.hpp"
 #include "function_storage.hpp"
 #include "parser.hpp"
 #include "renderer.hpp"
@@ -29,6 +30,7 @@ class Environment {
   FunctionStorage function_storage;
   TemplateStorage template_storage;
   std::vector<RenderErrorInfo> last_render_errors; // Track errors from last render
+  std::shared_ptr<CallbackCache> callback_cache_; // Optional callback cache
 
 protected:
   LexerConfig lexer_config;
@@ -137,6 +139,164 @@ public:
   /// Clears the callback wrapper (disables instrumentation)
   void clear_callback_wrapper() {
     render_config.callback_wrapper = nullptr;
+  }
+
+  /*!
+   * \brief Enables callback caching with the given configuration.
+   *
+   * When enabled, callback results will be cached based on function name
+   * and arguments, providing significant performance improvements for
+   * repeated calls with the same arguments.
+   *
+   * @param config Cache configuration (TTL, max entries, etc.)
+   *
+   * Example:
+   * @code
+   * env.enable_callback_cache(CallbackCacheConfig{
+   *     .ttl = std::chrono::seconds(5),
+   *     .max_entries = 10000
+   * });
+   * @endcode
+   */
+  void enable_callback_cache(const CallbackCacheConfig& config = CallbackCacheConfig{}) {
+    callback_cache_ = std::make_shared<CallbackCache>(config);
+    render_config.callback_wrapper = callback_cache_->make_caching_wrapper();
+  }
+
+  /*!
+   * \brief Enables callback caching with a predicate to filter which callbacks are cached.
+   *
+   * @param config Cache configuration
+   * @param predicate Function returning true for callbacks that should be cached
+   *
+   * Example:
+   * @code
+   * env.enable_callback_cache(
+   *     CallbackCacheConfig{.ttl = std::chrono::seconds(5)},
+   *     [](const std::string& name) {
+   *         // Don't cache callbacks with side effects or non-deterministic results
+   *         return name != "random" && name != "capture_screenshot";
+   *     }
+   * );
+   * @endcode
+   */
+  void enable_callback_cache(const CallbackCacheConfig& config,
+                              CallbackCache::CachePredicate predicate) {
+    callback_cache_ = std::make_shared<CallbackCache>(config);
+    callback_cache_->set_cache_predicate(std::move(predicate));
+    render_config.callback_wrapper = callback_cache_->make_caching_wrapper();
+  }
+
+  /*!
+   * \brief Enables callback caching with an inner wrapper for chained instrumentation.
+   *
+   * This allows combining caching with other instrumentation like tracing.
+   * The inner wrapper is called only on cache misses.
+   *
+   * @param config Cache configuration
+   * @param inner_wrapper Wrapper to call on cache misses (e.g., for tracing)
+   * @param predicate Optional predicate to filter which callbacks are cached
+   *
+   * Example:
+   * @code
+   * env.enable_callback_cache_with_wrapper(
+   *     CallbackCacheConfig{.ttl = std::chrono::seconds(5)},
+   *     [&ctx](const std::string& name, const Arguments& args,
+   *            const std::function<json()>& thunk) {
+   *         auto span = ctx.StartSpan("decorator:" + name);
+   *         auto result = thunk();
+   *         ctx.EndSpan(span);
+   *         return result;
+   *     }
+   * );
+   * @endcode
+   */
+  void enable_callback_cache_with_wrapper(const CallbackCacheConfig& config,
+                                           const CallbackWrapper& inner_wrapper,
+                                           CallbackCache::CachePredicate predicate = nullptr) {
+    callback_cache_ = std::make_shared<CallbackCache>(config);
+    if (predicate) {
+      callback_cache_->set_cache_predicate(std::move(predicate));
+    }
+    render_config.callback_wrapper = callback_cache_->make_caching_wrapper_with_inner(inner_wrapper);
+  }
+
+  /*!
+   * \brief Sets an external callback cache instance.
+   *
+   * This allows sharing a cache between multiple Environment instances (e.g., when
+   * copying a PromptEngine for different ContextEngine renders within the same dialogue turn).
+   *
+   * @param cache The external cache instance to use
+   * @param predicate Optional predicate to filter which callbacks are cached
+   *
+   * Example:
+   * @code
+   * auto shared_cache = std::make_shared<CallbackCache>(CallbackCacheConfig{
+   *     .ttl = std::chrono::seconds(5),
+   *     .max_entries = 10000
+   * });
+   *
+   * // Both environments share the same cache
+   * env1.set_callback_cache(shared_cache, my_predicate);
+   * env2.set_callback_cache(shared_cache, my_predicate);
+   * @endcode
+   */
+  void set_callback_cache(std::shared_ptr<CallbackCache> cache,
+                          CallbackCache::CachePredicate predicate = nullptr) {
+    callback_cache_ = cache;
+    if (predicate && cache) {
+      cache->set_cache_predicate(std::move(predicate));
+    }
+    if (cache) {
+      render_config.callback_wrapper = cache->make_caching_wrapper();
+    } else {
+      render_config.callback_wrapper = nullptr;
+    }
+  }
+
+  /*!
+   * \brief Disables callback caching.
+   *
+   * Clears the cache and removes the caching wrapper.
+   * Note: If you had a callback wrapper set before enabling caching, you'll need to re-set it.
+   */
+  void disable_callback_cache() {
+    callback_cache_.reset();
+    render_config.callback_wrapper = nullptr;
+  }
+
+  /*!
+   * \brief Gets the callback cache instance.
+   *
+   * @return Shared pointer to the cache, or nullptr if caching is not enabled
+   */
+  std::shared_ptr<CallbackCache> get_callback_cache() const {
+    return callback_cache_;
+  }
+
+  /*!
+   * \brief Clears all entries in the callback cache.
+   *
+   * Does nothing if caching is not enabled.
+   */
+  void clear_callback_cache() {
+    if (callback_cache_) {
+      callback_cache_->clear();
+    }
+  }
+
+  /*!
+   * \brief Invalidates cached entries for a specific callback.
+   *
+   * @param function_name The callback to invalidate
+   * @return Number of entries removed
+   */
+  size_t invalidate_callback_cache(const std::string& function_name) {
+    if (callback_cache_) {
+      return callback_cache_->invalidate(function_name);
+    }
+    return 0;
   }
 
   Template parse(std::string_view input) {

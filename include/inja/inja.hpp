@@ -32,5 +32,6 @@ SOFTWARE.
 #include "parser.hpp"
 #include "renderer.hpp"
 #include "template.hpp"
+#include "callback_cache.hpp"
 
 #endif // INCLUDE_INJA_INJA_HPP_
