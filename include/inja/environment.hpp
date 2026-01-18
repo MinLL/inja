@@ -142,6 +142,24 @@ public:
   }
 
   /*!
+   * \brief Sets an instrumentation callback for receiving internal events.
+   *
+   * When set, the renderer emits events at key points during template
+   * processing (set statements, loops, includes, in-place optimizations, etc.)
+   * to provide visibility into internal operations for debugging.
+   *
+   * @param callback The callback to receive instrumentation events
+   */
+  void set_instrumentation_callback(const InstrumentationCallback& callback) {
+    render_config.instrumentation_callback = callback;
+  }
+
+  /// Clears the instrumentation callback
+  void clear_instrumentation_callback() {
+    render_config.instrumentation_callback = nullptr;
+  }
+
+  /*!
    * \brief Enables callback caching with the given configuration.
    *
    * When enabled, callback results will be cached based on function name
@@ -417,6 +435,20 @@ public:
   */
   void add_callback(const std::string& name, int num_args, const CallbackFunction& callback) {
     function_storage.add_callback(name, num_args, callback);
+  }
+
+  /*!
+  @brief Adds a callback with an optional in-place mutation optimization.
+
+  The in-place callback is used when the renderer detects a self-assignment pattern:
+    {% set x = func(x, ...) %}
+
+  In this case, instead of copying x and then assigning the result back,
+  the in-place callback mutates x directly, avoiding the copy.
+  */
+  void add_callback(const std::string& name, int num_args, const CallbackFunction& callback,
+                    const InPlaceCallbackFunction& inplace_callback) {
+    function_storage.add_callback(name, num_args, callback, inplace_callback);
   }
 
   /*!

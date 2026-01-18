@@ -17,27 +17,41 @@ namespace inja {
 inline void register_array_functions(Environment& env) {
   
   // append(array, item) - Add item to end of array and return the array
-  env.add_callback("append", 2, [](Arguments& args) {
+  // Normal callback (makes a copy)
+  auto append_callback = [](Arguments& args) {
     if (!args[0]->is_array()) {
       return *args[0]; // Return unchanged if not an array
     }
     json result = *args[0]; // Make a copy
     result.push_back(*args[1]);
     return result;
-  });
+  };
+  // In-place callback (mutates directly, used for self-assignment optimization)
+  auto append_inplace = [](json& arr, Arguments& remaining_args) {
+    if (arr.is_array() && !remaining_args.empty()) {
+      arr.push_back(*remaining_args[0]);
+    }
+  };
+  env.add_callback("append", 2, append_callback, append_inplace);
 
   // push(array, item) - Alias for append
-  env.add_callback("push", 2, [](Arguments& args) {
+  auto push_callback = [](Arguments& args) {
     if (!args[0]->is_array()) {
       return *args[0];
     }
     json result = *args[0];
     result.push_back(*args[1]);
     return result;
-  });
+  };
+  auto push_inplace = [](json& arr, Arguments& remaining_args) {
+    if (arr.is_array() && !remaining_args.empty()) {
+      arr.push_back(*remaining_args[0]);
+    }
+  };
+  env.add_callback("push", 2, push_callback, push_inplace);
 
   // extend(array, items) - Add multiple items to array
-  env.add_callback("extend", 2, [](Arguments& args) {
+  auto extend_callback = [](Arguments& args) {
     if (!args[0]->is_array() || !args[1]->is_array()) {
       return *args[0];
     }
@@ -46,7 +60,15 @@ inline void register_array_functions(Environment& env) {
       result.push_back(item);
     }
     return result;
-  });
+  };
+  auto extend_inplace = [](json& arr, Arguments& remaining_args) {
+    if (arr.is_array() && !remaining_args.empty() && remaining_args[0]->is_array()) {
+      for (const auto& item : *remaining_args[0]) {
+        arr.push_back(item);
+      }
+    }
+  };
+  env.add_callback("extend", 2, extend_callback, extend_inplace);
 
   // insert(array, index, item) - Insert item at specific position
   env.add_callback("insert", 3, [](Arguments& args) {

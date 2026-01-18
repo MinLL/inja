@@ -17,6 +17,21 @@ using CallbackFunction = std::function<json(Arguments& args)>;
 using VoidCallbackFunction = std::function<void(Arguments& args)>;
 
 /*!
+ * \brief Callback function type for in-place mutation optimization.
+ *
+ * This is used when the renderer detects a self-assignment pattern like:
+ *   {% set items = append(items, x) %}
+ *
+ * Instead of copying the array, the in-place callback mutates the first
+ * argument directly. The callback receives:
+ *   - first_arg: Mutable reference to the first argument (the array being modified)
+ *   - remaining_args: Vector of const pointers to remaining arguments
+ *
+ * The callback should mutate first_arg in place and not return anything.
+ */
+using InPlaceCallbackFunction = std::function<void(json& first_arg, Arguments& remaining_args)>;
+
+/*!
  * \brief Class for builtin functions and user-defined callbacks.
  */
 class FunctionStorage {
@@ -74,9 +89,12 @@ public:
   };
 
   struct FunctionData {
-    explicit FunctionData(const Operation& op, const CallbackFunction& cb = CallbackFunction {}): operation(op), callback(cb) {}
+    explicit FunctionData(const Operation& op, const CallbackFunction& cb = CallbackFunction {},
+                          const InPlaceCallbackFunction& inplace_cb = InPlaceCallbackFunction {})
+        : operation(op), callback(cb), inplace_callback(inplace_cb) {}
     const Operation operation;
     const CallbackFunction callback;
+    const InPlaceCallbackFunction inplace_callback;  // Optional: for self-assignment optimization
   };
 
 private:
@@ -123,6 +141,26 @@ public:
 
   void add_callback(std::string_view name, int num_args, const CallbackFunction& callback) {
     function_storage.emplace(std::make_pair(static_cast<std::string>(name), num_args), FunctionData {Operation::Callback, callback});
+  }
+
+  /*!
+   * \brief Adds a callback with an optional in-place mutation optimization.
+   *
+   * The in-place callback is used when the renderer detects a self-assignment pattern:
+   *   {% set x = func(x, ...) %}
+   *
+   * In this case, instead of copying x and then assigning the result back,
+   * the in-place callback mutates x directly, avoiding the copy.
+   *
+   * @param name Function name
+   * @param num_args Number of arguments
+   * @param callback The normal callback (used when not in self-assignment context)
+   * @param inplace_callback The in-place callback (used for self-assignment optimization)
+   */
+  void add_callback(std::string_view name, int num_args, const CallbackFunction& callback,
+                    const InPlaceCallbackFunction& inplace_callback) {
+    function_storage.emplace(std::make_pair(static_cast<std::string>(name), num_args),
+                             FunctionData {Operation::Callback, callback, inplace_callback});
   }
 
   FunctionData find_function(std::string_view name, int num_args) const {

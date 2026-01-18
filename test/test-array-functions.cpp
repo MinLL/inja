@@ -211,10 +211,174 @@ Has age: {{ has_key(person, "age") }}
 {% set result = append(notArray, "item") %}
 Result: {{ result }}
 )";
-    
+
     CHECK_NOTHROW(env.render(tmpl, data));
     auto result = env.render(tmpl, data);
     CHECK(result.find("string") != std::string::npos);
+  }
+}
+
+TEST_CASE("self-assignment in-place optimization") {
+  inja::Environment env;
+  inja::register_array_functions(env);
+
+  inja::json data;
+
+  SUBCASE("in-place optimization with callback wrapper for tracing") {
+    // Verify that the callback wrapper is still invoked with in-place optimization
+    int append_call_count = 0;
+    env.set_callback_wrapper([&](const std::string& name,
+                                  const inja::Arguments& args,
+                                  const std::function<inja::json()>& thunk) {
+      if (name == "append") {
+        append_call_count++;
+      }
+      return thunk();
+    });
+
+    std::string tmpl = R"(
+{% set items = [] %}
+{% set items = append(items, 1) %}
+{% set items = append(items, 2) %}
+{% set items = append(items, 3) %}
+{{ items }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("[1,2,3]") != std::string::npos);
+    CHECK(append_call_count == 3);  // All three append calls should be traced
+  }
+
+  SUBCASE("append self-assignment produces correct result") {
+    // The optimization should produce the same result as without
+    std::string tmpl = R"(
+{% set items = [] %}
+{% set items = append(items, 1) %}
+{% set items = append(items, 2) %}
+{% set items = append(items, 3) %}
+{{ items }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("[1,2,3]") != std::string::npos);
+  }
+
+  SUBCASE("push self-assignment produces correct result") {
+    std::string tmpl = R"(
+{% set items = [] %}
+{% set items = push(items, "a") %}
+{% set items = push(items, "b") %}
+{% set items = push(items, "c") %}
+{{ items }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("[\"a\",\"b\",\"c\"]") != std::string::npos);
+  }
+
+  SUBCASE("extend self-assignment produces correct result") {
+    std::string tmpl = R"(
+{% set items = [1] %}
+{% set items = extend(items, [2, 3]) %}
+{% set items = extend(items, [4, 5]) %}
+{{ items }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("[1,2,3,4,5]") != std::string::npos);
+  }
+
+  SUBCASE("non-self-assignment still works") {
+    // When assigning to a different variable, normal copy behavior
+    std::string tmpl = R"(
+{% set original = [1, 2] %}
+{% set copy = append(original, 3) %}
+Original: {{ original }}
+Copy: {{ copy }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("Original: [1,2]") != std::string::npos);
+    CHECK(result.find("Copy: [1,2,3]") != std::string::npos);
+  }
+
+  SUBCASE("self-assignment with complex items") {
+    std::string tmpl = R"(
+{% set items = [] %}
+{% set items = append(items, {"name": "Item1", "value": 100}) %}
+{% set items = append(items, {"name": "Item2", "value": 200}) %}
+Count: {{ items | length }}
+First: {{ items.0.name }}
+Second: {{ items.1.value }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("Count: 2") != std::string::npos);
+    CHECK(result.find("First: Item1") != std::string::npos);
+    CHECK(result.find("Second: 200") != std::string::npos);
+  }
+
+  SUBCASE("self-assignment in loop") {
+    data["source"] = inja::json::array({1, 2, 3, 4, 5});
+
+    std::string tmpl = R"(
+{% set evens = [] %}
+{% for item in source %}
+  {% if item % 2 == 0 %}
+    {% set evens = append(evens, item) %}
+  {% endif %}
+{% endfor %}
+Evens: {{ evens }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("[2,4]") != std::string::npos);
+  }
+
+  SUBCASE("nested property self-assignment falls back to copy") {
+    // Nested property access like foo.bar should fall back to normal path
+    // since our detection only handles simple variable names
+    std::string tmpl = R"(
+{% set foo = {"items": [1, 2]} %}
+{% set foo.items = append(foo.items, 3) %}
+{{ foo.items }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("[1,2,3]") != std::string::npos);
+  }
+
+  SUBCASE("expression as first argument falls back to copy") {
+    // When first arg is not a simple variable, use normal path
+    std::string tmpl = R"(
+{% set items = [] %}
+{% set items = append(reverse(items), 1) %}
+{{ items }}
+)";
+
+    // This should still work, just using the copy path
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("[1]") != std::string::npos);
+  }
+
+  SUBCASE("large array building performance") {
+    // Build a large array to test optimization effectiveness
+    // This test verifies correctness; actual performance improvement
+    // should be measured with profiling/tracing
+    std::string tmpl = R"(
+{% set items = [] %}
+{% for i in range(100) %}
+  {% set items = append(items, i) %}
+{% endfor %}
+Count: {{ items | length }}
+First: {{ items.0 }}
+Last: {{ items.99 }}
+)";
+
+    auto result = env.render(tmpl, data);
+    CHECK(result.find("Count: 100") != std::string::npos);
+    CHECK(result.find("First: 0") != std::string::npos);
+    CHECK(result.find("Last: 99") != std::string::npos);
   }
 }
 

@@ -98,6 +98,30 @@ class Renderer : public NodeVisitor {
     return !data->empty();
   }
 
+  void emit_event(InstrumentationEvent event) {
+    if (config.instrumentation_callback) {
+      config.instrumentation_callback(InstrumentationData(event));
+    }
+  }
+
+  void emit_event(InstrumentationEvent event, const std::string& name) {
+    if (config.instrumentation_callback) {
+      config.instrumentation_callback(InstrumentationData(event, name));
+    }
+  }
+
+  void emit_event(InstrumentationEvent event, const std::string& name, const std::string& detail) {
+    if (config.instrumentation_callback) {
+      config.instrumentation_callback(InstrumentationData(event, name, detail));
+    }
+  }
+
+  void emit_event(InstrumentationEvent event, const std::string& name, const std::string& detail, size_t count) {
+    if (config.instrumentation_callback) {
+      config.instrumentation_callback(InstrumentationData(event, name, detail, count));
+    }
+  }
+
   void print_data(const std::shared_ptr<json>& value) {
     if (value->is_string()) {
       if (config.html_autoescape) {
@@ -786,6 +810,8 @@ class Renderer : public NodeVisitor {
       throw_renderer_error("object must be an array", node);
     }
 
+    emit_event(InstrumentationEvent::ForLoopStart, node.value, "array", result->size());
+
     if (!current_loop_data->empty()) {
       auto tmp = *current_loop_data; // Because of clang-3
       (*current_loop_data)["parent"] = std::move(tmp);
@@ -817,6 +843,8 @@ class Renderer : public NodeVisitor {
     } else {
       current_loop_data = &additional_data["loop"];
     }
+
+    emit_event(InstrumentationEvent::ForLoopEnd, node.value, "array", index);
   }
 
   void visit(const ForObjectStatementNode& node) override {
@@ -831,6 +859,8 @@ class Renderer : public NodeVisitor {
     if (!result->is_object()) {
       throw_renderer_error("object must be an object", node);
     }
+
+    emit_event(InstrumentationEvent::ForLoopStart, node.value, "object", result->size());
 
     if (!current_loop_data->empty()) {
       (*current_loop_data)["parent"] = std::move(*current_loop_data);
@@ -863,6 +893,8 @@ class Renderer : public NodeVisitor {
     } else {
       current_loop_data = &additional_data["loop"];
     }
+
+    emit_event(InstrumentationEvent::ForLoopEnd, node.value, "object", index);
   }
 
   void visit(const IfStatementNode& node) override {
@@ -876,12 +908,18 @@ class Renderer : public NodeVisitor {
   }
 
   void visit(const IncludeStatementNode& node) override {
+    emit_event(InstrumentationEvent::IncludeStart, node.file);
+
     auto sub_renderer = Renderer(config, template_storage, function_storage);
     const auto included_template_it = template_storage.find(node.file);
     if (included_template_it != template_storage.end()) {
       sub_renderer.render_to(*output_stream, included_template_it->second, *data_input, &additional_data);
+      emit_event(InstrumentationEvent::IncludeEnd, node.file, "success");
     } else if (config.throw_at_missing_includes) {
+      emit_event(InstrumentationEvent::IncludeEnd, node.file, "not_found");
       throw_renderer_error("include '" + node.file + "' not found", node);
+    } else {
+      emit_event(InstrumentationEvent::IncludeEnd, node.file, "not_found_ignored");
     }
   }
 
@@ -910,18 +948,120 @@ class Renderer : public NodeVisitor {
     current_template = template_stack.back();
   }
 
+  /*!
+   * \brief Attempts to use in-place optimization for self-assignment patterns.
+   *
+   * Detects patterns like: {% set items = append(items, x) %}
+   * When the first argument of the function is the same variable being assigned,
+   * and the function has an in-place callback registered, we can mutate directly
+   * instead of copying.
+   *
+   * @return true if in-place optimization was used, false otherwise
+   */
+  bool try_inplace_self_assignment(const SetStatementNode& node, const std::string& ptr) {
+    // Check if the expression is a function call
+    // (Don't emit events for these common non-interesting cases)
+    if (!node.expression.root) {
+      return false;
+    }
+
+    auto* func_node = dynamic_cast<const FunctionNode*>(node.expression.root.get());
+    if (!func_node || func_node->operation != FunctionStorage::Operation::Callback) {
+      return false;
+    }
+
+    // Check if the function has at least one argument
+    if (func_node->arguments.empty()) {
+      return false;
+    }
+
+    // Check if the first argument is a simple variable reference matching our key
+    auto* data_node = dynamic_cast<const DataNode*>(func_node->arguments[0].get());
+    if (!data_node || data_node->name != node.key) {
+      return false;
+    }
+
+    // Look up the function and check if it has an in-place callback
+    auto func_data = function_storage.find_function(func_node->name, static_cast<int>(func_node->arguments.size()));
+    if (func_data.operation != FunctionStorage::Operation::Callback || !func_data.inplace_callback) {
+      // This IS interesting - self-assignment pattern detected but function doesn't have in-place variant
+      emit_event(InstrumentationEvent::InplaceOptSkipped, node.key, "no_inplace_cb:" + func_node->name);
+      return false;
+    }
+
+    // Get a mutable reference to the variable
+    json::json_pointer json_ptr(ptr);
+
+    // Ensure the variable exists (initialize to null if not)
+    if (!additional_data.contains(json_ptr)) {
+      // Variable doesn't exist yet - can't do in-place mutation
+      // Fall back to normal evaluation which will create it
+      emit_event(InstrumentationEvent::InplaceOptSkipped, node.key, "var_not_exists:" + func_node->name);
+      return false;
+    }
+
+    json& target = additional_data[json_ptr];
+
+    // Evaluate remaining arguments (skip first one since we're using the target directly)
+    Arguments remaining_args;
+    remaining_args.reserve(func_node->arguments.size() - 1);
+
+    for (size_t i = 1; i < func_node->arguments.size(); ++i) {
+      func_node->arguments[i]->accept(*this);
+      remaining_args.push_back(data_eval_stack.top());
+      data_eval_stack.pop();
+    }
+
+    // Call the in-place callback
+    if (config.callback_wrapper) {
+      // Wrap for tracing/instrumentation
+      // Note: we pass a dummy thunk since in-place doesn't return a value
+      // IMPORTANT: We return a small placeholder instead of target to avoid copying
+      // the potentially large array just for tracing purposes.
+      Arguments all_args;
+      all_args.push_back(&target);
+      for (const auto* arg : remaining_args) {
+        all_args.push_back(arg);
+      }
+      config.callback_wrapper(func_node->name, all_args, [&]() {
+        func_data.inplace_callback(target, remaining_args);
+        // Return size info instead of full array to avoid O(n) copy
+        return json{{"_inplace", true}, {"size", target.is_array() ? target.size() : 0}};
+      });
+    } else {
+      func_data.inplace_callback(target, remaining_args);
+    }
+
+    // Emit success event with array size for performance tracking
+    size_t target_size = target.is_array() ? target.size() : 0;
+    emit_event(InstrumentationEvent::InplaceOptUsed, node.key, func_node->name, target_size);
+
+    return true;
+  }
+
   void visit(const SetStatementNode& node) override {
+    emit_event(InstrumentationEvent::SetStatementStart, node.key);
+
     std::string ptr = node.key;
     replace_substring(ptr, ".", "/");
     ptr = "/" + ptr;
-    
+
     try {
+      // Try in-place optimization first
+      if (try_inplace_self_assignment(node, ptr)) {
+        emit_event(InstrumentationEvent::SetStatementEnd, node.key, "inplace");
+        return;  // Successfully used in-place optimization
+      }
+
+      // Fall back to normal evaluation
       auto result = eval_expression_list(node.expression);
       if (result) {
         additional_data[json::json_pointer(ptr)] = *result;
+        emit_event(InstrumentationEvent::SetStatementEnd, node.key, "copy");
       } else if (config.graceful_errors) {
         // In graceful error mode, set to null if expression failed
         additional_data[json::json_pointer(ptr)] = nullptr;
+        emit_event(InstrumentationEvent::SetStatementEnd, node.key, "null_graceful");
       } else {
         throw_renderer_error("failed to evaluate expression for variable '" + node.key + "'", node);
       }
@@ -929,6 +1069,7 @@ class Renderer : public NodeVisitor {
       if (config.graceful_errors) {
         // In graceful error mode, set to null on exception
         additional_data[json::json_pointer(ptr)] = nullptr;
+        emit_event(InstrumentationEvent::SetStatementEnd, node.key, "exception_graceful");
       } else {
         throw_renderer_error("failed to set variable '" + node.key + "': " + e.what(), node);
       }
@@ -936,6 +1077,7 @@ class Renderer : public NodeVisitor {
       if (config.graceful_errors) {
         // Catch all exceptions including SEH
         additional_data[json::json_pointer(ptr)] = nullptr;
+        emit_event(InstrumentationEvent::SetStatementEnd, node.key, "unknown_exception");
       } else {
         throw_renderer_error("failed to set variable '" + node.key + "' with unknown exception", node);
       }
@@ -960,10 +1102,14 @@ public:
       current_loop_data = &additional_data["loop"];
     }
 
+    emit_event(InstrumentationEvent::RenderStart);
+
     template_stack.emplace_back(current_template);
     current_template->root.accept(*this);
 
     data_tmp_stack.clear();
+
+    emit_event(InstrumentationEvent::RenderEnd);
   }
   
   const std::vector<RenderErrorInfo>& get_render_errors() const {
