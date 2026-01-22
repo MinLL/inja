@@ -219,13 +219,15 @@ public:
     parser_config.search_included_templates_in_files = search_in_files;
   }
 
-  /// Sets whether a missing include will throw an error
+  /// Sets whether a missing include will throw an error (thread-safe)
   void set_throw_at_missing_includes(bool will_throw) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     render_config.throw_at_missing_includes = will_throw;
   }
 
-  /// Sets whether we'll automatically perform HTML escape
+  /// Sets whether we'll automatically perform HTML escape (thread-safe)
   void set_html_autoescape(bool will_escape) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     render_config.html_autoescape = will_escape;
   }
 
@@ -247,11 +249,13 @@ public:
    * @endcode
    */
   void set_callback_wrapper(const CallbackWrapper& wrapper) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     render_config.callback_wrapper = wrapper;
   }
-  
-  /// Clears the callback wrapper (disables instrumentation)
+
+  /// Clears the callback wrapper (disables instrumentation, thread-safe)
   void clear_callback_wrapper() {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     render_config.callback_wrapper = nullptr;
   }
 
@@ -265,11 +269,13 @@ public:
    * @param callback The callback to receive instrumentation events
    */
   void set_instrumentation_callback(const InstrumentationCallback& callback) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     render_config.instrumentation_callback = callback;
   }
 
-  /// Clears the instrumentation callback
+  /// Clears the instrumentation callback (thread-safe)
   void clear_instrumentation_callback() {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     render_config.instrumentation_callback = nullptr;
   }
 
@@ -291,6 +297,7 @@ public:
    * @endcode
    */
   void enable_callback_cache(const CallbackCacheConfig& config = CallbackCacheConfig{}) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     callback_cache_ = std::make_shared<CallbackCache>(config);
     render_config.callback_wrapper = callback_cache_->make_caching_wrapper();
   }
@@ -314,6 +321,7 @@ public:
    */
   void enable_callback_cache(const CallbackCacheConfig& config,
                               CallbackCache::CachePredicate predicate) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     callback_cache_ = std::make_shared<CallbackCache>(config);
     callback_cache_->set_cache_predicate(std::move(predicate));
     render_config.callback_wrapper = callback_cache_->make_caching_wrapper();
@@ -346,6 +354,7 @@ public:
   void enable_callback_cache_with_wrapper(const CallbackCacheConfig& config,
                                            const CallbackWrapper& inner_wrapper,
                                            CallbackCache::CachePredicate predicate = nullptr) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     callback_cache_ = std::make_shared<CallbackCache>(config);
     if (predicate) {
       callback_cache_->set_cache_predicate(std::move(predicate));
@@ -376,6 +385,7 @@ public:
    */
   void set_callback_cache(std::shared_ptr<CallbackCache> cache,
                           CallbackCache::CachePredicate predicate = nullptr) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     callback_cache_ = cache;
     if (predicate && cache) {
       cache->set_cache_predicate(std::move(predicate));
@@ -394,6 +404,7 @@ public:
    * Note: If you had a callback wrapper set before enabling caching, you'll need to re-set it.
    */
   void disable_callback_cache() {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     callback_cache_.reset();
     render_config.callback_wrapper = nullptr;
   }
@@ -529,8 +540,16 @@ public:
     auto tmpl_storage = template_storage_.load(std::memory_order_acquire);
     auto func_storage = function_storage_.load(std::memory_order_acquire);
 
+    // Snapshot render_config under lock to avoid torn reads of callback_wrapper
+    // (std::function assignment is not atomic - concurrent read/write causes heap corruption)
+    RenderConfig config_snapshot;
+    {
+      std::lock_guard<std::mutex> lock(write_mutex_);
+      config_snapshot = render_config;
+    }
+
     // Create renderer with snapshots
-    Renderer renderer(render_config, *tmpl_storage, *func_storage);
+    Renderer renderer(config_snapshot, *tmpl_storage, *func_storage);
     renderer.render_to(os, tmpl, data);
 
     // Copy errors from Renderer to thread-local storage for thread-safe access
@@ -546,8 +565,9 @@ public:
   // Note: get_last_render_errors() and clear_render_errors() are defined above
   // and use thread-local storage for thread-safety
 
-  /// Sets whether to use graceful error handling (missing variables/functions render as original text)
+  /// Sets whether to use graceful error handling (missing variables/functions render as original text, thread-safe)
   void set_graceful_errors(bool graceful) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
     parser_config.graceful_errors = graceful;
     render_config.graceful_errors = graceful;
   }
