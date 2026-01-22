@@ -1,9 +1,12 @@
 #ifndef INCLUDE_INJA_ENVIRONMENT_HPP_
 #define INCLUDE_INJA_ENVIRONMENT_HPP_
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -25,12 +28,35 @@ void register_array_functions(Environment& env);
 
 /*!
  * \brief Class for changing the configuration.
+ *
+ * Thread-safety design:
+ * - function_storage and template_storage use atomic shared_ptr for lock-free reads
+ * - Write operations (add_callback, include_template) use copy-on-write with a mutex
+ * - Render errors are thread-local so each thread sees its own errors
+ * - Parse operations use a thread-local cache that merges into shared storage after completion
  */
 class Environment {
-  FunctionStorage function_storage;
-  TemplateStorage template_storage;
-  std::vector<RenderErrorInfo> last_render_errors; // Track errors from last render
+  // Atomic shared_ptr for lock-free read access to functions during render
+  std::atomic<std::shared_ptr<FunctionStorage>> function_storage_{
+      std::make_shared<FunctionStorage>()
+  };
+
+  // Atomic shared_ptr for lock-free read access to templates during render
+  std::atomic<std::shared_ptr<TemplateStorage>> template_storage_{
+      std::make_shared<TemplateStorage>()
+  };
+
+  // Mutex for coordinating write operations (brief, rare)
+  mutable std::mutex write_mutex_;
+
   std::shared_ptr<CallbackCache> callback_cache_; // Optional callback cache
+
+  // Thread-local storage for render errors (each thread sees its own errors)
+  static inline thread_local std::vector<RenderErrorInfo> tl_render_errors_;
+
+  // Thread-local cache for templates discovered during parsing
+  // This allows lock-free parsing; templates are merged into shared storage after parse completes
+  static inline thread_local TemplateStorage tl_parse_cache_;
 
 protected:
   LexerConfig lexer_config;
@@ -45,15 +71,103 @@ private:
     register_array_functions(*this);
   }
 
+  // Merge thread-local parse cache into shared template storage
+  // Called after parse() completes to publish discovered templates
+  void merge_parse_cache() {
+    if (tl_parse_cache_.empty()) return;
+
+    std::lock_guard<std::mutex> lock(write_mutex_);
+
+    // Copy-on-write: create new storage with merged templates
+    auto current = template_storage_.load(std::memory_order_acquire);
+    auto new_storage = std::make_shared<TemplateStorage>(*current);
+
+    // Copy templates from thread-local cache to new storage
+    // (structured binding keys are const, so we copy rather than move)
+    for (const auto& [name, tmpl] : tl_parse_cache_) {
+      new_storage->try_emplace(name, tmpl);
+    }
+
+    // Atomic swap - renders in progress keep using old storage
+    template_storage_.store(new_storage, std::memory_order_release);
+    tl_parse_cache_.clear();
+  }
+
 public:
+  // Get thread-local errors from current thread's last render
+  const std::vector<RenderErrorInfo>& get_last_render_errors() const {
+    return tl_render_errors_;
+  }
+
+  // Clear thread-local errors (called at start of render)
+  void clear_render_errors() {
+    tl_render_errors_.clear();
+  }
+
+  // Add error to thread-local storage (called by Renderer)
+  static void add_render_error(const RenderErrorInfo& error) {
+    tl_render_errors_.push_back(error);
+  }
+
+  // Get function storage snapshot for lock-free reads (used by Parser/Renderer)
+  std::shared_ptr<FunctionStorage> get_function_storage_snapshot() const {
+    return function_storage_.load(std::memory_order_acquire);
+  }
+
+  // Get template storage snapshot for lock-free reads (used by Renderer)
+  std::shared_ptr<TemplateStorage> get_template_storage_snapshot() const {
+    return template_storage_.load(std::memory_order_acquire);
+  }
+
+  // Add template to thread-local parse cache (called during parsing)
+  static void add_to_parse_cache(const std::string& name, Template tmpl) {
+    tl_parse_cache_[name] = std::move(tmpl);
+  }
+
+  // Find template - check thread-local cache first, then shared storage
+  // Returns nullptr if not found
+  const Template* find_template(const std::string& name) const {
+    // Check thread-local parse cache first (no lock, no atomic)
+    auto it = tl_parse_cache_.find(name);
+    if (it != tl_parse_cache_.end()) {
+      return &it->second;
+    }
+
+    // Atomic load - lock free
+    auto storage = template_storage_.load(std::memory_order_acquire);
+    auto shared_it = storage->find(name);
+    return (shared_it != storage->end()) ? &shared_it->second : nullptr;
+  }
+
   Environment(): Environment("") {}
-  
+
   explicit Environment(const std::filesystem::path& global_path): input_path(global_path), output_path(global_path) {
     init_default_functions();
   }
-  
+
   Environment(const std::filesystem::path& input_path, const std::filesystem::path& output_path): input_path(input_path), output_path(output_path) {
     init_default_functions();
+  }
+
+  // Copy constructor - needed because std::atomic is not copyable
+  // Copies the current state of atomic members (snapshot semantics)
+  Environment(const Environment& other)
+      : lexer_config(other.lexer_config),
+        parser_config(other.parser_config),
+        render_config(other.render_config),
+        input_path(other.input_path),
+        output_path(other.output_path) {
+    // Copy atomic shared_ptr contents (load current value, store in new atomic)
+    function_storage_.store(
+        std::make_shared<FunctionStorage>(*other.function_storage_.load(std::memory_order_acquire)),
+        std::memory_order_release);
+    template_storage_.store(
+        std::make_shared<TemplateStorage>(*other.template_storage_.load(std::memory_order_acquire)),
+        std::memory_order_release);
+    // Copy callback cache (shared, not deeply copied - new Environment uses same cache)
+    callback_cache_ = other.callback_cache_;
+    // Note: callback_wrapper_, cache_predicate_, and instrumentation_callback_
+    // are function objects that should be re-registered on the new Environment
   }
 
   /// Sets the opener and closer for template statements
@@ -318,15 +432,48 @@ public:
   }
 
   Template parse(std::string_view input) {
-    Parser parser(parser_config, lexer_config, template_storage, function_storage);
-    return parser.parse(input, input_path);
+    // Get snapshots for lock-free access
+    // The shared_ptr keeps the storage alive for the duration of parsing
+    auto func_storage = function_storage_.load(std::memory_order_acquire);
+    auto tmpl_storage = template_storage_.load(std::memory_order_acquire);
+
+    // Parser writes discovered templates to thread-local cache,
+    // but can also look up existing templates in shared storage (kept alive by shared_ptr)
+    Parser parser(parser_config, lexer_config, tl_parse_cache_, *func_storage, tmpl_storage);
+    try {
+      Template result = parser.parse(input, input_path);
+      // Merge any templates discovered during parsing into shared storage
+      merge_parse_cache();
+      return result;
+    } catch (...) {
+      // Clear thread-local cache on exception to prevent stale templates
+      // from leaking into subsequent parse operations on this thread
+      tl_parse_cache_.clear();
+      throw;
+    }
   }
 
   Template parse_template(const std::filesystem::path& filename) {
-    Parser parser(parser_config, lexer_config, template_storage, function_storage);
-    auto result = Template(Parser::load_file(input_path / filename));
-    parser.parse_into_template(result, (input_path / filename).string());
-    return result;
+    // Get snapshots for lock-free access
+    // The shared_ptr keeps the storage alive for the duration of parsing
+    auto func_storage = function_storage_.load(std::memory_order_acquire);
+    auto tmpl_storage = template_storage_.load(std::memory_order_acquire);
+
+    // Parser writes discovered templates to thread-local cache,
+    // but can also look up existing templates in shared storage (kept alive by shared_ptr)
+    Parser parser(parser_config, lexer_config, tl_parse_cache_, *func_storage, tmpl_storage);
+    try {
+      auto result = Template(Parser::load_file(input_path / filename));
+      parser.parse_into_template(result, (input_path / filename).string());
+      // Merge any templates discovered during parsing into shared storage
+      merge_parse_cache();
+      return result;
+    } catch (...) {
+      // Clear thread-local cache on exception to prevent stale templates
+      // from leaking into subsequent parse operations on this thread
+      tl_parse_cache_.clear();
+      throw;
+    }
   }
 
   Template parse_file(const std::filesystem::path& filename) {
@@ -375,26 +522,30 @@ public:
   }
 
   std::ostream& render_to(std::ostream& os, const Template& tmpl, const json& data) {
-    Renderer renderer(render_config, template_storage, function_storage);
+    // Clear thread-local errors at start of render
+    tl_render_errors_.clear();
+
+    // Get storage snapshots for lock-free access
+    auto tmpl_storage = template_storage_.load(std::memory_order_acquire);
+    auto func_storage = function_storage_.load(std::memory_order_acquire);
+
+    // Create renderer with snapshots
+    Renderer renderer(render_config, *tmpl_storage, *func_storage);
     renderer.render_to(os, tmpl, data);
-    last_render_errors = renderer.get_render_errors();
+
+    // Copy errors from Renderer to thread-local storage for thread-safe access
+    tl_render_errors_ = renderer.get_render_errors();
+
     return os;
   }
 
-  std::ostream& render_to(std::ostream& os, const std::string_view input, const json& data) {
+  std::ostream& render_to(std::ostream& os, std::string_view input, const json& data) {
     return render_to(os, parse(input), data);
   }
   
-  /// Gets the errors from the last render operation (only populated in graceful_errors mode)
-  const std::vector<RenderErrorInfo>& get_last_render_errors() const {
-    return last_render_errors;
-  }
-  
-  /// Clears the stored render errors
-  void clear_render_errors() {
-    last_render_errors.clear();
-  }
-  
+  // Note: get_last_render_errors() and clear_render_errors() are defined above
+  // and use thread-local storage for thread-safety
+
   /// Sets whether to use graceful error handling (missing variables/functions render as original text)
   void set_graceful_errors(bool graceful) {
     parser_config.graceful_errors = graceful;
@@ -402,7 +553,7 @@ public:
   }
 
   std::string load_file(const std::string& filename) {
-    const Parser parser(parser_config, lexer_config, template_storage, function_storage);
+    // Note: load_file is a static method that doesn't need storage references
     return Parser::load_file(input_path / filename);
   }
 
@@ -417,28 +568,40 @@ public:
   }
 
   /*!
-  @brief Adds a variadic callback
+  @brief Adds a variadic callback (thread-safe via copy-on-write)
   */
   void add_callback(const std::string& name, const CallbackFunction& callback) {
     add_callback(name, -1, callback);
   }
 
   /*!
-  @brief Adds a variadic void callback
+  @brief Adds a variadic void callback (thread-safe via copy-on-write)
   */
   void add_void_callback(const std::string& name, const VoidCallbackFunction& callback) {
     add_void_callback(name, -1, callback);
   }
 
   /*!
-  @brief Adds a callback with given number or arguments
+  @brief Adds a callback with given number or arguments (thread-safe via copy-on-write)
+
+  Uses copy-on-write to ensure thread safety. Renders in progress will continue
+  using the old function storage, while new renders will see the updated version.
   */
   void add_callback(const std::string& name, int num_args, const CallbackFunction& callback) {
-    function_storage.add_callback(name, num_args, callback);
+    std::lock_guard<std::mutex> lock(write_mutex_);
+
+    // Copy-on-write: create new storage with the callback added
+    auto current = function_storage_.load(std::memory_order_acquire);
+    auto new_storage = std::make_shared<FunctionStorage>(*current);
+    new_storage->add_callback(name, num_args, callback);
+
+    // Atomic swap - renders in progress keep using old storage
+    function_storage_.store(new_storage, std::memory_order_release);
   }
 
   /*!
   @brief Adds a callback with an optional in-place mutation optimization.
+  (thread-safe via copy-on-write)
 
   The in-place callback is used when the renderer detects a self-assignment pattern:
     {% set x = func(x, ...) %}
@@ -448,25 +611,50 @@ public:
   */
   void add_callback(const std::string& name, int num_args, const CallbackFunction& callback,
                     const InPlaceCallbackFunction& inplace_callback) {
-    function_storage.add_callback(name, num_args, callback, inplace_callback);
+    std::lock_guard<std::mutex> lock(write_mutex_);
+
+    // Copy-on-write: create new storage with the callback added
+    auto current = function_storage_.load(std::memory_order_acquire);
+    auto new_storage = std::make_shared<FunctionStorage>(*current);
+    new_storage->add_callback(name, num_args, callback, inplace_callback);
+
+    // Atomic swap - renders in progress keep using old storage
+    function_storage_.store(new_storage, std::memory_order_release);
   }
 
   /*!
-  @brief Adds a void callback with given number or arguments
+  @brief Adds a void callback with given number or arguments (thread-safe via copy-on-write)
   */
   void add_void_callback(const std::string& name, int num_args, const VoidCallbackFunction& callback) {
-    function_storage.add_callback(name, num_args, [callback](Arguments& args) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+
+    // Copy-on-write: create new storage with the callback added
+    auto current = function_storage_.load(std::memory_order_acquire);
+    auto new_storage = std::make_shared<FunctionStorage>(*current);
+    new_storage->add_callback(name, num_args, [callback](Arguments& args) {
       callback(args);
       return json();
     });
+
+    // Atomic swap - renders in progress keep using old storage
+    function_storage_.store(new_storage, std::memory_order_release);
   }
 
   /** Includes a template with a given name into the environment.
    * Then, a template can be rendered in another template using the
    * include "<name>" syntax.
+   * Thread-safe via copy-on-write.
    */
   void include_template(const std::string& name, const Template& tmpl) {
-    template_storage[name] = tmpl;
+    std::lock_guard<std::mutex> lock(write_mutex_);
+
+    // Copy-on-write: create new storage with the template added
+    auto current = template_storage_.load(std::memory_order_acquire);
+    auto new_storage = std::make_shared<TemplateStorage>(*current);
+    (*new_storage)[name] = tmpl;
+
+    // Atomic swap - renders in progress keep using old storage
+    template_storage_.store(new_storage, std::memory_order_release);
   }
 
   /*!

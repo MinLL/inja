@@ -80,8 +80,8 @@ class Renderer : public NodeVisitor {
   std::stack<NotFoundInfo> not_found_stack; // Can hold DataNode or FunctionNode for error reporting
 
   bool break_rendering {false};
-  
-  std::vector<RenderErrorInfo> render_errors; // Track errors in graceful mode
+
+  std::vector<RenderErrorInfo> render_errors; // Track errors in graceful mode (per-instance)
 
   static bool truthy(const json* data) {
     // In graceful error mode, data can be nullptr for missing variables

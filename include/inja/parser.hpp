@@ -25,6 +25,10 @@ namespace inja {
 
 /*!
  * \brief Class for parsing an inja Template.
+ *
+ * Thread-safety: Parser writes discovered templates to the provided TemplateStorage reference,
+ * which should be a thread-local cache when used from Environment::parse().
+ * The Environment merges this cache into shared storage after parse completes.
  */
 class Parser {
   using Arguments = std::vector<std::shared_ptr<ExpressionNode>>;
@@ -33,7 +37,8 @@ class Parser {
   const ParserConfig& config;
 
   Lexer lexer;
-  TemplateStorage& template_storage;
+  TemplateStorage& template_storage;  // Thread-local cache for discovered templates
+  std::shared_ptr<const TemplateStorage> shared_template_storage;  // Shared storage kept alive during parsing
   const FunctionStorage& function_storage;
 
   Token tok, peek_tok;
@@ -89,8 +94,20 @@ class Parser {
   }
 
   void add_to_template_storage(const std::filesystem::path& path, std::string& template_name) {
+    // Check thread-local cache first
     if (template_storage.find(template_name) != template_storage.end()) {
       return;
+    }
+
+    // Check shared storage for existing templates (e.g., from include_template())
+    // shared_template_storage is a shared_ptr that keeps the storage alive during parsing
+    if (shared_template_storage) {
+      auto it = shared_template_storage->find(template_name);
+      if (it != shared_template_storage->end()) {
+        // Copy from shared storage to local cache so Renderer can find it
+        template_storage[template_name] = it->second;
+        return;
+      }
     }
 
     const std::string original_name = template_name;
@@ -102,20 +119,30 @@ class Parser {
         template_name.erase(0, 2);
       }
 
-      if (template_storage.find(template_name) == template_storage.end()) {
-        // Load file
-        std::ifstream file;
-        file.open(template_name);
-        if (!file.fail()) {
-          const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-
-          auto include_template = Template(text);
-          template_storage.emplace(template_name, include_template);
-          parse_into_template(template_storage[template_name], template_name);
+      // Check both caches with the modified name too
+      if (template_storage.find(template_name) != template_storage.end()) {
+        return;
+      }
+      if (shared_template_storage) {
+        auto it = shared_template_storage->find(template_name);
+        if (it != shared_template_storage->end()) {
+          template_storage[template_name] = it->second;
           return;
-        } else if (!config.include_callback) {
-          INJA_THROW(FileError("failed accessing file at '" + template_name + "'"));
         }
+      }
+
+      // Load file
+      std::ifstream file;
+      file.open(template_name);
+      if (!file.fail()) {
+        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+        auto include_template = Template(text);
+        template_storage.emplace(template_name, include_template);
+        parse_into_template(template_storage[template_name], template_name);
+        return;
+      } else if (!config.include_callback) {
+        INJA_THROW(FileError("failed accessing file at '" + template_name + "'"));
       }
     }
 
@@ -761,8 +788,9 @@ class Parser {
 
 public:
   explicit Parser(const ParserConfig& parser_config, const LexerConfig& lexer_config, TemplateStorage& template_storage,
-                  const FunctionStorage& function_storage)
-      : config(parser_config), lexer(lexer_config), template_storage(template_storage), function_storage(function_storage) {}
+                  const FunctionStorage& function_storage, std::shared_ptr<const TemplateStorage> shared_storage = nullptr)
+      : config(parser_config), lexer(lexer_config), template_storage(template_storage),
+        shared_template_storage(std::move(shared_storage)), function_storage(function_storage) {}
 
   Template parse(std::string_view input, const std::filesystem::path& path) {
     auto result = Template(std::string(input));
@@ -771,7 +799,7 @@ public:
   }
 
   void parse_into_template(Template& tmpl, const std::filesystem::path& filename) {
-    auto sub_parser = Parser(config, lexer.get_config(), template_storage, function_storage);
+    auto sub_parser = Parser(config, lexer.get_config(), template_storage, function_storage, shared_template_storage);
     sub_parser.parse_into(tmpl, filename.parent_path());
   }
 
