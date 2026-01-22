@@ -202,12 +202,54 @@ public:
    * @param value The result to cache
    */
   void put(const std::string& function_name, const Arguments& args, const json& value) {
+    const std::string key = make_cache_key(function_name, args);
+    put_with_key(key, value);
+  }
+
+  /*!
+   * \brief Attempts to get a cached value using a pre-computed cache key.
+   *
+   * This variant is useful when the cache key includes additional context
+   * beyond function name and arguments (e.g., actor-specific context variables).
+   *
+   * @param key The pre-computed cache key
+   * @param[out] result The cached result if found and not expired
+   * @return true if a valid cached value was found, false otherwise
+   */
+  bool try_get_with_key(const std::string& key, json& result) {
+    const auto now = Clock::now();
+
+    // Try read lock first for cache hit (common case)
+    {
+      std::shared_lock<std::shared_mutex> lock(mutex_);
+
+      auto it = cache_map_.find(key);
+      if (it != cache_map_.end() && it->second->expiry > now) {
+        result = it->second->value;
+        ++hits_;
+        return true;
+      }
+    }
+
+    ++misses_;
+    return false;
+  }
+
+  /*!
+   * \brief Stores a value in the cache using a pre-computed cache key.
+   *
+   * This variant is useful when the cache key includes additional context
+   * beyond function name and arguments (e.g., actor-specific context variables).
+   *
+   * @param key The pre-computed cache key
+   * @param value The result to cache
+   */
+  void put_with_key(const std::string& key, const json& value) {
     // Don't cache void/empty results unless configured to
     if (!config_.cache_void_callbacks && value.is_null()) {
       return;
     }
 
-    const std::string key = make_cache_key(function_name, args);
     const auto expiry = Clock::now() + config_.ttl;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
