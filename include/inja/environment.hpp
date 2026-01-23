@@ -398,6 +398,28 @@ public:
   }
 
   /*!
+   * \brief Sets an external callback cache and a custom wrapper atomically.
+   *
+   * This avoids a race condition where setting cache and wrapper in two separate
+   * lock acquisitions could allow a concurrent render to snapshot the intermediate
+   * state (inja's caching wrapper without the custom wrapper).
+   *
+   * @param cache The shared cache instance to use
+   * @param wrapper The custom callback wrapper (e.g., with tracing)
+   * @param predicate Optional function returning true for callbacks that should be cached
+   */
+  void set_callback_cache_and_wrapper(std::shared_ptr<CallbackCache> cache,
+                                      const CallbackWrapper& wrapper,
+                                      CallbackCache::CachePredicate predicate = nullptr) {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    callback_cache_ = cache;
+    if (predicate && cache) {
+      cache->set_cache_predicate(std::move(predicate));
+    }
+    render_config.callback_wrapper = wrapper;
+  }
+
+  /*!
    * \brief Disables callback caching.
    *
    * Clears the cache and removes the caching wrapper.
