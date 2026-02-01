@@ -58,6 +58,12 @@ class Environment {
   // This allows lock-free parsing; templates are merged into shared storage after parse completes
   static inline thread_local TemplateStorage tl_parse_cache_;
 
+  // Generation counter for cache invalidation across threads
+  // Incremented when clear_template_storage() is called
+  static inline std::atomic<uint64_t> storage_generation_{0};
+  // Thread-local last seen generation - used to detect when local cache needs clearing
+  static inline thread_local uint64_t tl_last_generation_{0};
+
 protected:
   LexerConfig lexer_config;
   ParserConfig parser_config;
@@ -117,6 +123,26 @@ public:
   // Get template storage snapshot for lock-free reads (used by Renderer)
   std::shared_ptr<TemplateStorage> get_template_storage_snapshot() const {
     return template_storage_.load(std::memory_order_acquire);
+  }
+
+  // Clear all cached templates from inja's internal storage
+  // Call this when templates have been modified on disk and need to be re-read
+  void clear_template_storage() {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    template_storage_.store(std::make_shared<TemplateStorage>(), std::memory_order_release);
+    tl_parse_cache_.clear();
+    // Increment generation to signal all threads to clear their local caches
+    storage_generation_.fetch_add(1, std::memory_order_release);
+  }
+
+  // Check if thread-local cache needs clearing due to storage invalidation
+  // Called at start of parse operations to ensure fresh templates are loaded
+  static void check_cache_invalidation() {
+    uint64_t current_gen = storage_generation_.load(std::memory_order_acquire);
+    if (tl_last_generation_ != current_gen) {
+      tl_parse_cache_.clear();
+      tl_last_generation_ = current_gen;
+    }
   }
 
   // Add template to thread-local parse cache (called during parsing)
@@ -465,6 +491,9 @@ public:
   }
 
   Template parse(std::string_view input) {
+    // Check if storage was invalidated and clear thread-local cache if needed
+    check_cache_invalidation();
+
     // Get snapshots for lock-free access
     // The shared_ptr keeps the storage alive for the duration of parsing
     auto func_storage = function_storage_.load(std::memory_order_acquire);
@@ -487,6 +516,9 @@ public:
   }
 
   Template parse_template(const std::filesystem::path& filename) {
+    // Check if storage was invalidated and clear thread-local cache if needed
+    check_cache_invalidation();
+
     // Get snapshots for lock-free access
     // The shared_ptr keeps the storage alive for the duration of parsing
     auto func_storage = function_storage_.load(std::memory_order_acquire);
