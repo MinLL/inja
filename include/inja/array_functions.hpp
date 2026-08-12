@@ -277,9 +277,8 @@ inline void register_array_functions(Environment& env) {
   // get(object, key, default=null) - Get value with default
   env.add_callback("get", 2, [](Arguments& args) {
     if (args[0]->is_object() && args[1]->is_string()) {
-      auto key = args[1]->get<std::string>();
-      if (args[0]->contains(key)) {
-        return (*args[0])[key];
+      if (const auto* member = find_member_ignore_case(*args[0], args[1]->get<std::string>())) {
+        return *member;
       }
     }
     return json(nullptr);
@@ -287,9 +286,8 @@ inline void register_array_functions(Environment& env) {
 
   env.add_callback("get", 3, [](Arguments& args) {
     if (args[0]->is_object() && args[1]->is_string()) {
-      auto key = args[1]->get<std::string>();
-      if (args[0]->contains(key)) {
-        return (*args[0])[key];
+      if (const auto* member = find_member_ignore_case(*args[0], args[1]->get<std::string>())) {
+        return *member;
       }
     }
     return *args[2]; // Return default value
@@ -298,7 +296,7 @@ inline void register_array_functions(Environment& env) {
   // has_key(object, key) - Check if object has key
   env.add_callback("has_key", 2, [](Arguments& args) {
     if (args[0]->is_object() && args[1]->is_string()) {
-      return json(args[0]->contains(args[1]->get<std::string>()));
+      return json(find_member_ignore_case(*args[0], args[1]->get<std::string>()) != nullptr);
     }
     return json(false);
   });

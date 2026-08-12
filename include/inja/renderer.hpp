@@ -304,10 +304,18 @@ class Renderer : public NodeVisitor {
   }
 
   void visit(const DataNode& node) override {
+    // Exact lookups run first in both containers so existing precedence (loop and
+    // set variables shadowing input data) is unchanged. Only when both miss do we
+    // retry ignoring key case, which rescues data whose keys came from Skyrim's
+    // case-unstable string interning.
     if (additional_data.contains(node.ptr)) {
       data_eval_stack.push(&(additional_data[node.ptr]));
     } else if (data_input->contains(node.ptr)) {
       data_eval_stack.push(&(*data_input)[node.ptr]);
+    } else if (const auto* additional_ci = find_by_dotted_name_ignore_case(additional_data, node.name)) {
+      data_eval_stack.push(additional_ci);
+    } else if (const auto* input_ci = find_by_dotted_name_ignore_case(*data_input, node.name)) {
+      data_eval_stack.push(input_ci);
     } else {
       // Try to evaluate as a no-argument callback
       const auto function_data = function_storage.find_function(node.name, 0);
@@ -461,8 +469,9 @@ class Renderer : public NodeVisitor {
       
       // Safe access with graceful error handling
       try {
-        if (container && container->contains(not_found.name)) {
-          data_eval_stack.push(&container->at(not_found.name));
+        const json* member = container ? find_member_ignore_case(*container, not_found.name) : nullptr;
+        if (member) {
+          data_eval_stack.push(member);
         } else {
           // Member not found
           if (config.graceful_errors) {
@@ -486,8 +495,8 @@ class Renderer : public NodeVisitor {
       try {
         if (args[0]->is_object()) {
           const auto key = args[1]->get<std::string>();
-          if (args[0]->contains(key)) {
-            data_eval_stack.push(&args[0]->at(key));
+          if (const auto* member = find_member_ignore_case(*args[0], key)) {
+            data_eval_stack.push(member);
           } else {
             if (config.graceful_errors) {
               data_eval_stack.push(nullptr);
@@ -552,14 +561,15 @@ class Renderer : public NodeVisitor {
     case Op::Exists: {
       INJA_OP_TRY_BEGIN
         auto&& name = get_arguments<1>(node)[0]->get_ref<const json::string_t&>();
-        make_result(data_input->contains(json::json_pointer(DataNode::convert_dot_to_ptr(name))));
+        make_result(data_input->contains(json::json_pointer(DataNode::convert_dot_to_ptr(name))) ||
+                    find_by_dotted_name_ignore_case(*data_input, name) != nullptr);
       INJA_OP_TRY_END_GRACEFUL("exists")
     } break;
     case Op::ExistsInObject: {
       INJA_OP_TRY_BEGIN
         const auto args = get_arguments<2>(node);
         auto&& name = args[1]->get_ref<const json::string_t&>();
-        make_result(args[0]->find(name) != args[0]->end());
+        make_result(find_member_ignore_case(*args[0], name) != nullptr);
       INJA_OP_TRY_END_GRACEFUL("existsIn")
     } break;
     case Op::First: {

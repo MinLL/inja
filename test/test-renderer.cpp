@@ -521,3 +521,65 @@ $$ endif
     CHECK(env.render(string_template, data) == "Hello Peter\n    You really are Peter\n");
   }
 }
+
+TEST_CASE("case-insensitive property access") {
+  inja::Environment env;
+  inja::json data;
+  data["Actors"] = {{{"Name", "Bill"}}};
+  data["actor"] = {{"name", "Bob"}};
+  data["Both"] = {{"name", "exact"}, {"Name", "folded"}};
+  data["UTF8"] = {{"名前", "Yuki"}};
+
+  SUBCASE("dotted access") {
+    CHECK(env.render("{{ actors.0.name }}", data) == "Bill");
+    CHECK(env.render("{{ Actors.0.Name }}", data) == "Bill");
+    CHECK(env.render("{{ ACTORS.0.NAME }}", data) == "Bill");
+    CHECK(env.render("{{ Actor.NAME }}", data) == "Bob");
+  }
+
+  SUBCASE("exact match wins over folded match") {
+    CHECK(env.render("{{ Both.name }}", data) == "exact");
+    CHECK(env.render("{{ Both.Name }}", data) == "folded");
+    // No exact match, so the first member in key order wins ("Name" sorts before "name")
+    CHECK(env.render("{{ Both.NAME }}", data) == "folded");
+  }
+
+  SUBCASE("member access on an expression result") {
+    CHECK(env.render("{{ at(Actors, 0).name }}", data) == "Bill");
+    CHECK(env.render("{{ first(actors).NAME }}", data) == "Bill");
+  }
+
+  SUBCASE("at") {
+    CHECK(env.render("{{ at(actor, \"NAME\") }}", data) == "Bob");
+    CHECK(env.render("{{ at(Actor, \"name\") }}", data) == "Bob");
+  }
+
+  SUBCASE("get and has_key") {
+    CHECK(env.render("{{ get(actor, \"NAME\") }}", data) == "Bob");
+    CHECK(env.render("{{ get(actor, \"missing\", \"fallback\") }}", data) == "fallback");
+    CHECK(env.render("{{ has_key(actor, \"NAME\") }}", data) == "true");
+    CHECK(env.render("{{ has_key(actor, \"missing\") }}", data) == "false");
+  }
+
+  SUBCASE("exists and existsIn") {
+    CHECK(env.render("{{ exists(\"ACTOR\") }}", data) == "true");
+    CHECK(env.render("{{ exists(\"actors.0.name\") }}", data) == "true");
+    CHECK(env.render("{{ exists(\"nowhere\") }}", data) == "false");
+    CHECK(env.render("{{ existsIn(actor, \"NAME\") }}", data) == "true");
+    CHECK(env.render("{{ existsIn(actor, \"missing\") }}", data) == "false");
+  }
+
+  SUBCASE("loop variables") {
+    CHECK(env.render("{% for a in Actors %}{{ a.name }}{% endfor %}", data) == "Bill");
+    CHECK(env.render("{% for a in actors %}{{ a.NAME }}{% endfor %}", data) == "Bill");
+  }
+
+  SUBCASE("non-ASCII keys are compared byte-for-byte") {
+    CHECK(env.render("{{ at(utf8, \"名前\") }}", data) == "Yuki");
+  }
+
+  SUBCASE("genuinely missing keys still miss") {
+    CHECK_THROWS_WITH(env.render("{{ actor.missing }}", data), "[inja.exception.render_error] (at 1:4) variable 'actor.missing' not found");
+    CHECK_THROWS_WITH(env.render("{{ nowhere }}", data), "[inja.exception.render_error] (at 1:4) variable 'nowhere' not found");
+  }
+}
