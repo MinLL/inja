@@ -304,10 +304,14 @@ class Renderer : public NodeVisitor {
   }
 
   void visit(const DataNode& node) override {
-    // Exact lookups run first in both containers so existing precedence (loop and
-    // set variables shadowing input data) is unchanged. Only when both miss do we
-    // retry ignoring key case, which rescues data whose keys came from Skyrim's
-    // case-unstable string interning.
+    // Lookup order is exactness-major: exact additional data (loop and set variables),
+    // exact input data, then those same two ignoring key case. Every name that resolved
+    // before still resolves to the same value - the case-insensitive retries only rescue
+    // lookups that used to fail, e.g. data whose keys came from case-unstable string
+    // interning. Consequence worth knowing: additional data shadows input data only on
+    // an exact-case reference. Given a set variable `actors` and an input key `Actors`,
+    // `{{ actors }}` reads the set variable but `{{ Actors }}` reads the input data,
+    // because input-exact is tried before additional-case-insensitive.
     if (additional_data.contains(node.ptr)) {
       data_eval_stack.push(&(additional_data[node.ptr]));
     } else if (data_input->contains(node.ptr)) {

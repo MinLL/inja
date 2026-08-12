@@ -2,7 +2,7 @@
 #define INCLUDE_INJA_UTILS_HPP_
 
 #include <algorithm>
-#include <cctype>
+#include <charconv>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -57,6 +57,18 @@ inline SourceLocation get_source_location(std::string_view content, size_t pos) 
 }
 
 /*!
+@brief Folds a single byte to lower case, ASCII range only.
+
+Deliberately not std::tolower: that folds according to the active C locale, so a
+process running under a single-byte locale such as cp1251 or cp1252 would also fold
+bytes 0xC0-0xDE - exactly the UTF-8 lead-byte range - and make distinct non-ASCII
+keys compare equal. This keeps the folding independent of the ambient locale.
+*/
+inline char fold_ascii(char c) {
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
+/*!
 @brief Compares two strings for equality, ignoring ASCII case.
 
 Only ASCII letters are folded, so UTF-8 keys are compared byte-for-byte beyond
@@ -67,9 +79,7 @@ inline bool equals_ignore_case(std::string_view a, std::string_view b) {
     return false;
   }
   for (size_t i = 0; i < a.size(); i += 1) {
-    const auto lhs = std::tolower(static_cast<unsigned char>(a[i]));
-    const auto rhs = std::tolower(static_cast<unsigned char>(b[i]));
-    if (lhs != rhs) {
+    if (fold_ascii(a[i]) != fold_ascii(b[i])) {
       return false;
     }
   }
@@ -123,16 +133,12 @@ inline const json* find_by_dotted_name_ignore_case(const json& root, std::string
     if (current->is_object()) {
       current = find_member_ignore_case(*current, std::string(part));
     } else if (current->is_array()) {
-      // Cap the digit count so the accumulate below cannot overflow size_t
-      const bool is_index = !part.empty() && part.size() <= 10 && std::all_of(part.begin(), part.end(), [](char c) {
-        return std::isdigit(static_cast<unsigned char>(c)) != 0;
-      });
+      // from_chars is locale independent, rejects signs and trailing junk, and reports
+      // out-of-range instead of wrapping - so it accepts exactly the digit-only segments
+      // that name a reachable index.
       size_t index = 0;
-      if (is_index) {
-        for (const char c : part) {
-          index = index * 10 + static_cast<size_t>(c - '0');
-        }
-      }
+      const auto parsed = std::from_chars(part.data(), part.data() + part.size(), index);
+      const bool is_index = parsed.ec == std::errc() && parsed.ptr == part.data() + part.size();
       current = (is_index && index < current->size()) ? &(*current)[index] : nullptr;
     } else {
       return nullptr;
