@@ -149,7 +149,26 @@ class Parser {
     // Try include callback
     if (config.include_callback) {
       auto include_template = config.include_callback(path, original_name);
-      template_storage.emplace(template_name, include_template);
+
+      // The callback may hand back either an already-parsed Template (legacy behaviour, kept
+      // working) or a Template carrying only raw content. A content-only result is parsed here,
+      // exactly as the file branch above does, so that:
+      //   * nested {% include %} / {% extends %} inside callback-supplied content resolve
+      //     recursively through this same code path, and
+      //   * a callback never has to re-enter Environment::parse() while an outer parse is still
+      //     in flight (the inner call would clear the thread-local parse cache that the outer
+      //     Parser holds a live reference to).
+      //
+      // A parsed Template always has at least one root node unless its content renders to
+      // nothing at all (empty content, or comments only), in which case re-parsing it adds no
+      // nodes either - so an empty root is a safe discriminator: parsing it is either the
+      // desired work or a no-op, never a duplication.
+      const bool needs_parsing = include_template.root.nodes.empty();
+
+      const auto emplaced = template_storage.emplace(template_name, std::move(include_template));
+      if (needs_parsing && emplaced.second) {
+        parse_into_template(emplaced.first->second, template_name);
+      }
     }
   }
 
